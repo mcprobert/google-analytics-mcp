@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Google Analytics 4 MCP server (v3.0.0) — gives AI agents analysis-ready GA4 access with multi-property queries, multi-account OAuth, schema discovery, server-side aggregation, and smart defaults. Fork of surendranb/google-analytics-mcp. Built on FastMCP. Python 3.10+, Apache-2.0 license.
+Google Analytics 4 MCP server (v3.0.1) — gives AI agents analysis-ready GA4 access with multi-property queries, multi-account OAuth, schema discovery, server-side aggregation, and smart defaults. Fork of surendranb/google-analytics-mcp. Built on FastMCP. Python 3.10+, Apache-2.0 license.
 
 ## Commands
 

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-03-25
+
+### Fixed
+- **Security:** Credential files now created with 0o600 permissions, accounts directory with 0o700
+- **Security:** Path traversal prevention on email-based file operations via `_safe_account_path()` validation
+- **Security:** HTML-escape OAuth error callback responses to prevent XSS
+- **Security:** OAuth state parameter validation to prevent CSRF on callback
+- **Security:** HTTP request timeouts on OAuth token exchange and userinfo calls
+- **Concurrency:** Replaced shared class-level OAuth handler state with per-flow `_OAuthServer` instance
+- **Concurrency:** Added flow lock to prevent concurrent OAuth flow corruption
+- **Concurrency:** Server socket always cleaned up via `server_close()` in finally block
+- **Correctness:** Schema cache now keyed by `(property_id, account)` to prevent cross-account stale data
+- **Correctness:** Mutable default arguments in `get_ga4_data` replaced with `None` defaults
+- **Correctness:** Property ID validation rejects non-numeric IDs with clear error message
+- **Correctness:** `list_accounts` detects application default credentials instead of hardcoding service account
+- **Correctness:** Estimation failure now fails closed — returns warning instead of proceeding to full query
+- **Correctness:** Filter dimension names validated against property schema before API call
+- **Correctness:** Defensive handling of `e.details()` in error handler to prevent secondary crashes
+- **Correctness:** Removed dead `len(dimensions) == 0` check from `_should_aggregate`
+- **Packaging:** Created `ga4_mcp/tools/__init__.py` for reliable non-editable installs
+
 ## [3.0.0] - 2026-03-25
 
 ### Added
