@@ -38,6 +38,11 @@ def main():
         print(f"WARNING: Credentials file not found at '{credentials_path}'.", file=sys.stderr)
 
     # 2. Set default property ID and pre-cache its schema if provided
+    if property_id and not property_id.strip().isdigit():
+        print(f"WARNING: GA4_PROPERTY_ID '{property_id}' is not numeric. "
+              "Use the numeric property ID, not a Measurement ID (G-XXXX).", file=sys.stderr)
+        property_id = None
+
     metadata.DEFAULT_PROPERTY_ID = property_id
 
     if property_id:

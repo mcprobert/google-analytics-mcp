@@ -18,12 +18,12 @@ import sys
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from ga4_mcp.coordinator import mcp
 from ga4_mcp.auth import (
-    resolve_credentials, list_registered_accounts,
+    resolve_credentials, list_registered_accounts, has_default_credentials,
     start_oauth_flow, complete_oauth_flow,
     remove_account as _remove_account,
 )
 
-# Per-property schema cache: {property_id: schema_dict}
+# Per-property schema cache: {(property_id, account): schema_dict}
 SCHEMA_CACHE = {}
 
 # Default property ID from environment (set on startup, can be None)
@@ -31,20 +31,29 @@ DEFAULT_PROPERTY_ID = None
 
 
 def _resolve_property_id(property_id: str = None) -> str:
-    """Resolve property ID from parameter, falling back to the default."""
-    pid = property_id or DEFAULT_PROPERTY_ID
+    """Resolve property ID from parameter, falling back to the default.
+
+    Returns None if no ID available. Raises ValueError if ID is non-numeric.
+    """
+    pid = str(property_id or DEFAULT_PROPERTY_ID or "").strip()
     if not pid:
         return None
+    if not pid.isdigit():
+        raise ValueError(
+            f"Invalid property_id '{pid}'. Use the numeric GA4 property ID, "
+            f"not a Measurement ID like 'G-XXXX'."
+        )
     return pid
 
 
 def _get_schema(property_id: str, account: str = None) -> dict:
     """Get schema for a property, fetching and caching if needed."""
-    if property_id not in SCHEMA_CACHE:
+    cache_key = (property_id, account or "__default__")
+    if cache_key not in SCHEMA_CACHE:
         print(f"Fetching schema for property '{property_id}'...", file=sys.stderr)
-        SCHEMA_CACHE[property_id] = _fetch_schema(property_id, account)
+        SCHEMA_CACHE[cache_key] = _fetch_schema(property_id, account)
         print(f"Schema for property '{property_id}' loaded successfully.", file=sys.stderr)
-    return SCHEMA_CACHE[property_id]
+    return SCHEMA_CACHE[cache_key]
 
 
 def _fetch_schema(property_id: str, account: str = None) -> dict:
@@ -74,14 +83,27 @@ def _fetch_schema(property_id: str, account: str = None) -> dict:
     return schema
 
 
+def _resolve_pid_or_error(property_id: str = None) -> tuple:
+    """Resolve property ID, returning (pid, None) or (None, error_dict)."""
+    try:
+        pid = _resolve_property_id(property_id)
+    except ValueError as e:
+        return None, {"error": str(e)}
+    if not pid:
+        return None, {"error": "No property_id provided and no default GA4_PROPERTY_ID configured."}
+    return pid, None
+
+
 @mcp.tool()
 def list_accounts():
     """
     List all available accounts that can be used with the 'account' parameter.
-    Returns the service account (default) and any registered OAuth user accounts.
+    Returns default credentials (if available) and any registered OAuth user accounts.
     Register new accounts by running: python -m ga4_mcp.add_account --client-secrets <path>
     """
-    accounts = [{"email": "service-account (default)", "type": "service_account"}]
+    accounts = []
+    if has_default_credentials():
+        accounts.append({"email": "default credentials", "type": "application_default"})
     accounts.extend(list_registered_accounts())
     return {"accounts": accounts, "total": len(accounts)}
 
@@ -138,8 +160,11 @@ def remove_registered_account(email: str):
     Args:
         email: The email address of the account to remove.
     """
-    if _remove_account(email):
-        return {"status": "success", "message": f"Account '{email}' removed."}
+    try:
+        if _remove_account(email):
+            return {"status": "success", "message": f"Account '{email}' removed."}
+    except ValueError as e:
+        return {"error": str(e)}
     return {"error": f"No registered account found for '{email}'."}
 
 
@@ -151,7 +176,7 @@ def list_properties(account: str = None):
 
     Args:
         account: (Optional) Email of a registered OAuth account. If omitted, uses the
-                 default service account. Use list_accounts() to see available accounts.
+                 default credentials. Use list_accounts() to see available accounts.
     """
     try:
         from google.analytics.admin_v1beta import AnalyticsAdminServiceClient
@@ -178,9 +203,11 @@ def list_properties(account: str = None):
         return {
             "properties": result,
             "default_property_id": DEFAULT_PROPERTY_ID,
-            "using_account": account or "service-account",
+            "using_account": account or "default credentials",
             "total": len(result),
         }
+    except ValueError as e:
+        return {"error": str(e)}
     except Exception as e:
         return {"error": f"Failed to list properties: {e}"}
 
@@ -194,12 +221,12 @@ def search_schema(keyword: str, property_id: str = None, account: str = None):
 
     Args:
         keyword: One or more keywords to search for (e.g., "user", "campaign revenue").
-        property_id: (Optional) GA4 property ID. Defaults to the configured property.
-        account: (Optional) Email of a registered OAuth account. Omit for service account.
+        property_id: (Optional) GA4 property ID (numeric). Defaults to the configured property.
+        account: (Optional) Email of a registered OAuth account. Omit for default credentials.
     """
-    pid = _resolve_property_id(property_id)
-    if not pid:
-        return {"error": "No property_id provided and no default GA4_PROPERTY_ID configured."}
+    pid, err = _resolve_pid_or_error(property_id)
+    if err:
+        return err
 
     try:
         schema = _get_schema(pid, account)
@@ -209,7 +236,6 @@ def search_schema(keyword: str, property_id: str = None, account: str = None):
     scores = {}
     search_terms = keyword.lower().split()
 
-    # Search dimensions
     for name, info in schema["dimensions"].items():
         score = 0
         for term in search_terms:
@@ -220,7 +246,6 @@ def search_schema(keyword: str, property_id: str = None, account: str = None):
         if score > 0:
             scores[f"DIMENSION: {name}"] = score
 
-    # Search metrics
     for name, info in schema["metrics"].items():
         score = 0
         for term in search_terms:
@@ -234,7 +259,6 @@ def search_schema(keyword: str, property_id: str = None, account: str = None):
     if not scores:
         return {"message": f"No dimensions or metrics found matching '{keyword}'."}
 
-    # Sort by score descending and return top 10
     sorted_results = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     return {"top_results": dict(sorted_results[:10])}
 
@@ -247,12 +271,12 @@ def get_property_schema(property_id: str = None, account: str = None):
     a very large object (10k+ tokens). Use search_schema for most discovery tasks.
 
     Args:
-        property_id: (Optional) GA4 property ID. Defaults to the configured property.
-        account: (Optional) Email of a registered OAuth account. Omit for service account.
+        property_id: (Optional) GA4 property ID (numeric). Defaults to the configured property.
+        account: (Optional) Email of a registered OAuth account. Omit for default credentials.
     """
-    pid = _resolve_property_id(property_id)
-    if not pid:
-        return {"error": "No property_id provided and no default GA4_PROPERTY_ID configured."}
+    pid, err = _resolve_pid_or_error(property_id)
+    if err:
+        return err
 
     try:
         return _get_schema(pid, account)
@@ -267,12 +291,12 @@ def list_dimension_categories(property_id: str = None, account: str = None):
     This is a low-cost way to begin exploring the schema.
 
     Args:
-        property_id: (Optional) GA4 property ID. Defaults to the configured property.
-        account: (Optional) Email of a registered OAuth account. Omit for service account.
+        property_id: (Optional) GA4 property ID (numeric). Defaults to the configured property.
+        account: (Optional) Email of a registered OAuth account. Omit for default credentials.
     """
-    pid = _resolve_property_id(property_id)
-    if not pid:
-        return {"error": "No property_id provided and no default GA4_PROPERTY_ID configured."}
+    pid, err = _resolve_pid_or_error(property_id)
+    if err:
+        return err
 
     try:
         schema = _get_schema(pid, account)
@@ -295,12 +319,12 @@ def list_metric_categories(property_id: str = None, account: str = None):
     This is a low-cost way to begin exploring the schema.
 
     Args:
-        property_id: (Optional) GA4 property ID. Defaults to the configured property.
-        account: (Optional) Email of a registered OAuth account. Omit for service account.
+        property_id: (Optional) GA4 property ID (numeric). Defaults to the configured property.
+        account: (Optional) Email of a registered OAuth account. Omit for default credentials.
     """
-    pid = _resolve_property_id(property_id)
-    if not pid:
-        return {"error": "No property_id provided and no default GA4_PROPERTY_ID configured."}
+    pid, err = _resolve_pid_or_error(property_id)
+    if err:
+        return err
 
     try:
         schema = _get_schema(pid, account)
@@ -323,12 +347,12 @@ def get_dimensions_by_category(category: str, property_id: str = None, account: 
 
     Args:
         category: The category name to retrieve dimensions for.
-        property_id: (Optional) GA4 property ID. Defaults to the configured property.
-        account: (Optional) Email of a registered OAuth account. Omit for service account.
+        property_id: (Optional) GA4 property ID (numeric). Defaults to the configured property.
+        account: (Optional) Email of a registered OAuth account. Omit for default credentials.
     """
-    pid = _resolve_property_id(property_id)
-    if not pid:
-        return {"error": "No property_id provided and no default GA4_PROPERTY_ID configured."}
+    pid, err = _resolve_pid_or_error(property_id)
+    if err:
+        return err
 
     try:
         schema = _get_schema(pid, account)
@@ -352,12 +376,12 @@ def get_metrics_by_category(category: str, property_id: str = None, account: str
 
     Args:
         category: The category name to retrieve metrics for.
-        property_id: (Optional) GA4 property ID. Defaults to the configured property.
-        account: (Optional) Email of a registered OAuth account. Omit for service account.
+        property_id: (Optional) GA4 property ID (numeric). Defaults to the configured property.
+        account: (Optional) Email of a registered OAuth account. Omit for default credentials.
     """
-    pid = _resolve_property_id(property_id)
-    if not pid:
-        return {"error": "No property_id provided and no default GA4_PROPERTY_ID configured."}
+    pid, err = _resolve_pid_or_error(property_id)
+    if err:
+        return err
 
     try:
         schema = _get_schema(pid, account)

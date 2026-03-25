@@ -21,7 +21,7 @@ from google.analytics.data_v1beta.types import (
     OrderBy, MetricAggregation
 )
 from ga4_mcp.coordinator import mcp
-from ga4_mcp.tools.metadata import _resolve_property_id, _get_schema
+from ga4_mcp.tools.metadata import _resolve_pid_or_error, _get_schema
 from ga4_mcp.auth import resolve_credentials
 
 def _get_smart_sorting(dimensions, metrics):
@@ -33,14 +33,38 @@ def _get_smart_sorting(dimensions, metrics):
         order_bys.append(OrderBy(metric=OrderBy.MetricOrderBy(metric_name=metrics[0]), desc=True))
     return order_bys
 
-def _should_aggregate(dimensions, metrics):
+def _should_aggregate(dimensions):
     """Detect when server-side aggregation would be beneficial."""
-    return len(dimensions) == 0 or "date" not in dimensions
+    return "date" not in dimensions
+
+
+def _extract_filter_dimensions(node: dict) -> set:
+    """Recursively extract dimension field_name values from a filter expression dict."""
+    if not isinstance(node, dict):
+        return set()
+
+    dims = set()
+    if "filter" in node and isinstance(node["filter"], dict):
+        field = node["filter"].get("field_name")
+        if field:
+            dims.add(field)
+
+    for key in ("and_group", "or_group"):
+        group = node.get(key, {})
+        if isinstance(group, dict):
+            for expr in group.get("expressions", []):
+                dims |= _extract_filter_dimensions(expr)
+
+    if "not_expression" in node:
+        dims |= _extract_filter_dimensions(node["not_expression"])
+
+    return dims
+
 
 @mcp.tool()
 def get_ga4_data(
-    dimensions: list[str] = ["date"],
-    metrics: list[str] = ["totalUsers", "newUsers", "sessions"],
+    dimensions: list[str] = None,
+    metrics: list[str] = None,
     date_range_start: str = "7daysAgo",
     date_range_end: str = "yesterday",
     dimension_filter: dict = None,
@@ -72,8 +96,8 @@ def get_ga4_data(
       relevant data at the top.
 
     Args:
-        dimensions: List of GA4 dimensions (e.g., ["date", "city"]).
-        metrics: List of GA4 metrics (e.g., ["totalUsers", "sessions"]).
+        dimensions: List of GA4 dimensions (e.g., ["date", "city"]). Defaults to ["date"].
+        metrics: List of GA4 metrics (e.g., ["totalUsers", "sessions"]). Defaults to ["totalUsers", "newUsers", "sessions"].
         date_range_start: Start date in YYYY-MM-DD format or relative date ('7daysAgo').
         date_range_end: End date in YYYY-MM-DD format or relative date ('yesterday').
         dimension_filter: (Optional) A dictionary representing a GA4 FilterExpression
@@ -85,14 +109,19 @@ def get_ga4_data(
                                     warning and execute the query anyway.
         enable_aggregation: (Optional) If True, uses server-side aggregation when
                             beneficial. Defaults to True.
-        property_id: (Optional) GA4 property ID to query. Defaults to the configured property.
+        property_id: (Optional) GA4 property ID (numeric) to query. Defaults to the configured property.
                      Use list_properties() to see all available properties.
-        account: (Optional) Email of a registered OAuth account. Omit for service account.
+        account: (Optional) Email of a registered OAuth account. Omit for default credentials.
                  Use list_accounts() to see available accounts.
     """
-    pid = _resolve_property_id(property_id)
-    if not pid:
-        return {"error": "No property_id provided and no default GA4_PROPERTY_ID configured."}
+    if dimensions is None:
+        dimensions = ["date"]
+    if metrics is None:
+        metrics = ["totalUsers", "newUsers", "sessions"]
+
+    pid, err = _resolve_pid_or_error(property_id)
+    if err:
+        return err
 
     try:
         schema = _get_schema(pid, account)
@@ -121,6 +150,11 @@ def get_ga4_data(
         # --- Filter Expression Building ---
         filter_expression = None
         if dimension_filter:
+            # Validate filter dimensions against schema
+            filter_dims = _extract_filter_dimensions(dimension_filter)
+            for fdim in filter_dims:
+                if fdim not in valid_dims:
+                    return {"error": f"Invalid dimension in filter: '{fdim}'. Use search_schema() to find valid dimensions."}
             try:
                 filter_expression = FilterExpression(dimension_filter)
             except Exception as e:
@@ -162,7 +196,18 @@ def get_ga4_data(
                         ]
                     }
             except Exception as e:
-                print(f"DEBUG: Row count estimation failed: {e}", file=sys.stderr)
+                print(f"WARNING: Row count estimation failed: {e}", file=sys.stderr)
+                if estimate_only:
+                    return {"error": f"Could not estimate row count: {e}"}
+                if not proceed_with_large_dataset:
+                    return {
+                        "warning": "Could not safely estimate dataset size.",
+                        "estimation_error": str(e),
+                        "suggestions": [
+                            "Retry the query.",
+                            "Or re-run with proceed_with_large_dataset=True to bypass the safety check."
+                        ]
+                    }
 
         # --- Main GA4 API Call ---
         request = RunReportRequest(
@@ -173,7 +218,7 @@ def get_ga4_data(
             dimension_filter=filter_expression,
             limit=limit,
             order_bys=_get_smart_sorting(parsed_dimensions, parsed_metrics),
-            metric_aggregations=[MetricAggregation.TOTAL] if enable_aggregation and _should_aggregate(parsed_dimensions, parsed_metrics) else None
+            metric_aggregations=[MetricAggregation.TOTAL] if enable_aggregation and _should_aggregate(parsed_dimensions) else None
         )
         response = client.run_report(request=request)
 
@@ -197,6 +242,12 @@ def get_ga4_data(
     except Exception as e:
         error_message = f"Error fetching GA4 data: {str(e)}"
         print(error_message, file=sys.stderr)
-        if hasattr(e, 'details'):
-            error_message += f" Details: {e.details()}"
+        details = getattr(e, "details", None)
+        if callable(details):
+            try:
+                details = details()
+            except Exception:
+                details = None
+        if details:
+            error_message += f" Details: {details}"
         return {"error": error_message}

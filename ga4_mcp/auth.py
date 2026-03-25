@@ -1,14 +1,16 @@
 """Centralized credential management for multi-account GA4 access.
 
 Supports two credential types:
-- Service account: from GOOGLE_APPLICATION_CREDENTIALS env var (the default)
+- Service account / ADC: from GOOGLE_APPLICATION_CREDENTIALS or application default credentials
 - OAuth accounts: stored refresh tokens from interactive login
 
 Tokens are stored in ~/.config/ga4-mcp/accounts/{email}.json
 """
 
+import html
 import json
 import os
+import secrets
 import sys
 import threading
 import urllib.parse
@@ -30,8 +32,19 @@ SCOPES = [
     "openid",
 ]
 
-# Pending OAuth flow state
+# Pending OAuth flow state, guarded by _flow_lock
 _pending_flow = None
+_flow_lock = threading.Lock()
+
+
+def _write_private_json(path: Path, payload: dict) -> None:
+    """Write JSON to a file with restrictive permissions (0o600)."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    if os.name != "nt":
+        os.chmod(str(path), 0o600)
 
 
 def _get_oauth_client_config() -> dict:
@@ -47,9 +60,24 @@ def _get_oauth_client_config() -> dict:
 
 
 def get_accounts_dir() -> Path:
-    """Return the accounts directory, creating it if needed."""
-    ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
+    """Return the accounts directory, creating it with restrictive permissions."""
+    ACCOUNTS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name != "nt":
+        ACCOUNTS_DIR.chmod(0o700)
     return ACCOUNTS_DIR
+
+
+def _safe_account_path(email: str) -> Path:
+    """Construct a safe file path for an account email, preventing path traversal."""
+    if not email:
+        raise ValueError("Account email is required.")
+    base = get_accounts_dir().resolve()
+    candidate = (base / f"{email}.json").resolve(strict=False)
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        raise ValueError("Invalid account identifier.")
+    return candidate
 
 
 def list_registered_accounts() -> list[dict]:
@@ -68,6 +96,16 @@ def list_registered_accounts() -> list[dict]:
     return accounts
 
 
+def has_default_credentials() -> bool:
+    """Check if application default credentials are available."""
+    try:
+        from google.auth import default as auth_default
+        auth_default()
+        return True
+    except Exception:
+        return False
+
+
 def get_oauth_credentials(email: str) -> Credentials:
     """Load OAuth credentials for a registered account, refreshing if needed."""
     if email in _credentials_cache:
@@ -75,7 +113,7 @@ def get_oauth_credentials(email: str) -> Credentials:
         if creds.valid:
             return creds
 
-    token_file = get_accounts_dir() / f"{email}.json"
+    token_file = _safe_account_path(email)
     if not token_file.exists():
         raise ValueError(
             f"No stored credentials for '{email}'. "
@@ -100,8 +138,8 @@ def get_oauth_credentials(email: str) -> Credentials:
 
 
 def save_oauth_credentials(email: str, refresh_token: str, client_id: str, client_secret: str):
-    """Save OAuth credentials for an account."""
-    token_file = get_accounts_dir() / f"{email}.json"
+    """Save OAuth credentials for an account with restrictive file permissions."""
+    token_file = _safe_account_path(email)
     data = {
         "email": email,
         "refresh_token": refresh_token,
@@ -109,7 +147,7 @@ def save_oauth_credentials(email: str, refresh_token: str, client_id: str, clien
         "client_secret": client_secret,
         "token_uri": "https://oauth2.googleapis.com/token",
     }
-    token_file.write_text(json.dumps(data, indent=2))
+    _write_private_json(token_file, data)
     print(f"Credentials saved to {token_file}", file=sys.stderr)
 
 
@@ -117,16 +155,19 @@ def resolve_credentials(account: str = None):
     """Resolve credentials from an account parameter.
 
     Returns:
-        google credentials object, or None to use default (service account).
+        google credentials object, or None to use default (service account / ADC).
     """
     if not account:
         return None
-    return get_oauth_credentials(account)
+    try:
+        return get_oauth_credentials(account)
+    except ValueError:
+        raise
 
 
 def remove_account(email: str) -> bool:
     """Remove a registered OAuth account."""
-    token_file = get_accounts_dir() / f"{email}.json"
+    token_file = _safe_account_path(email)
     if token_file.exists():
         token_file.unlink()
         _credentials_cache.pop(email, None)
@@ -134,36 +175,54 @@ def remove_account(email: str) -> bool:
     return False
 
 
-# --- Two-phase interactive OAuth flow ---
+# --- Two-phase interactive OAuth flow with per-flow state ---
+
+class _OAuthServer(HTTPServer):
+    """HTTP server that carries per-flow OAuth state."""
+
+    def __init__(self, addr, handler_class, *, expected_state: str):
+        super().__init__(addr, handler_class)
+        self.expected_state = expected_state
+        self.done = threading.Event()
+        self.result = {}  # {"auth_code": ...} or {"error": ...}
+
 
 class _OAuthCallbackHandler(BaseHTTPRequestHandler):
     """HTTP handler that captures the OAuth callback code."""
 
-    auth_code = None
-    error = None
-
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
+        server = self.server  # type: _OAuthServer
+
+        # Validate state parameter
+        received_state = params.get("state", [None])[0]
+        if received_state != server.expected_state:
+            server.result = {"error": "Invalid OAuth state parameter."}
+            self._send_html(400, "<h2>Authentication failed: invalid state</h2>")
+            server.done.set()
+            return
 
         if "code" in params:
-            _OAuthCallbackHandler.auth_code = params["code"][0]
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(b"<html><body><h2>Authentication successful!</h2>"
-                             b"<p>You can close this window and return to Claude.</p></body></html>")
+            server.result = {"auth_code": params["code"][0]}
+            self._send_html(200,
+                "<h2>Authentication successful!</h2>"
+                "<p>You can close this window and return to Claude.</p>")
         elif "error" in params:
-            _OAuthCallbackHandler.error = params["error"][0]
-            self.send_response(400)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(f"<html><body><h2>Authentication failed: {params['error'][0]}</h2></body></html>".encode())
+            error_text = html.escape(params["error"][0], quote=True)
+            server.result = {"error": params["error"][0]}
+            self._send_html(400, f"<h2>Authentication failed: {error_text}</h2>")
         else:
-            self.send_response(400)
-            self.end_headers()
+            server.result = {"error": "No code or error in callback."}
+            self._send_html(400, "<h2>Unexpected callback</h2>")
 
-        threading.Thread(target=self.server.shutdown).start()
+        server.done.set()
+
+    def _send_html(self, code: int, body: str):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(f"<html><body>{body}</body></html>".encode("utf-8"))
 
     def log_message(self, format, *args):
         pass
@@ -177,6 +236,11 @@ def start_oauth_flow() -> dict:
     """
     global _pending_flow
 
+    with _flow_lock:
+        if _pending_flow is not None:
+            return {"error": "An OAuth flow is already in progress. "
+                             "Call complete_account_login() first, or wait for it to time out."}
+
     client_config = _get_oauth_client_config()
     if not client_config:
         return {"error": "GA4_MCP_OAUTH_CLIENT_SECRETS environment variable not set or file not found. "
@@ -184,15 +248,13 @@ def start_oauth_flow() -> dict:
 
     client_id = client_config["client_id"]
     client_secret = client_config["client_secret"]
+    state = secrets.token_urlsafe(32)
 
-    # Start local server
-    server = HTTPServer(("127.0.0.1", 0), _OAuthCallbackHandler)
+    # Start local server on a random port
+    host = "127.0.0.1"
+    server = _OAuthServer((host, 0), _OAuthCallbackHandler, expected_state=state)
     port = server.server_address[1]
-    redirect_uri = f"http://localhost:{port}"
-
-    # Reset handler state
-    _OAuthCallbackHandler.auth_code = None
-    _OAuthCallbackHandler.error = None
+    redirect_uri = f"http://{host}:{port}"
 
     # Build auth URL
     auth_params = {
@@ -202,6 +264,7 @@ def start_oauth_flow() -> dict:
         "scope": " ".join(SCOPES),
         "access_type": "offline",
         "prompt": "consent",
+        "state": state,
     }
     auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(auth_params)}"
 
@@ -211,13 +274,14 @@ def start_oauth_flow() -> dict:
     server_thread.start()
 
     # Store pending flow state
-    _pending_flow = {
-        "server": server,
-        "server_thread": server_thread,
-        "redirect_uri": redirect_uri,
-        "client_id": client_id,
-        "client_secret": client_secret,
-    }
+    with _flow_lock:
+        _pending_flow = {
+            "server": server,
+            "server_thread": server_thread,
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }
 
     return {"auth_url": auth_url}
 
@@ -230,30 +294,28 @@ def complete_oauth_flow(timeout_seconds: int = 120) -> dict:
     """
     global _pending_flow
 
-    if not _pending_flow:
-        return {"error": "No pending OAuth flow. Call start_oauth_flow() first."}
+    with _flow_lock:
+        if not _pending_flow:
+            return {"error": "No pending OAuth flow. Call add_account() first."}
+        flow = _pending_flow
 
-    flow = _pending_flow
-    server = flow["server"]
-    server_thread = flow["server_thread"]
+    server = flow["server"]  # type: _OAuthServer
 
-    # Wait for callback
-    server_thread.join(timeout=timeout_seconds)
-
-    # Clean up
-    server.shutdown()
-    _pending_flow = None
-
-    if _OAuthCallbackHandler.error:
-        return {"error": f"OAuth failed: {_OAuthCallbackHandler.error}"}
-
-    if not _OAuthCallbackHandler.auth_code:
-        return {"error": "OAuth timed out. The user did not complete authentication in time."}
-
-    # Exchange auth code for tokens
     try:
+        # Wait for callback via event
+        server.done.wait(timeout=timeout_seconds)
+
+        result = server.result
+
+        if "error" in result:
+            return {"error": f"OAuth failed: {result['error']}"}
+
+        if "auth_code" not in result:
+            return {"error": "OAuth timed out. The user did not complete authentication in time."}
+
+        # Exchange auth code for tokens
         token_data = {
-            "code": _OAuthCallbackHandler.auth_code,
+            "code": result["auth_code"],
             "client_id": flow["client_id"],
             "client_secret": flow["client_secret"],
             "redirect_uri": flow["redirect_uri"],
@@ -264,14 +326,14 @@ def complete_oauth_flow(timeout_seconds: int = 120) -> dict:
             data=urllib.parse.urlencode(token_data).encode(),
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        response = urllib.request.urlopen(req)
-        tokens = json.loads(response.read().decode())
+        with urllib.request.urlopen(req, timeout=10) as response:
+            tokens = json.loads(response.read().decode())
 
         # Get user email
         userinfo_req = urllib.request.Request("https://www.googleapis.com/oauth2/v2/userinfo")
         userinfo_req.add_header("Authorization", f"Bearer {tokens['access_token']}")
-        userinfo_response = urllib.request.urlopen(userinfo_req)
-        userinfo = json.loads(userinfo_response.read().decode())
+        with urllib.request.urlopen(userinfo_req, timeout=10) as userinfo_response:
+            userinfo = json.loads(userinfo_response.read().decode())
         email = userinfo.get("email")
 
         if not email:
@@ -287,4 +349,12 @@ def complete_oauth_flow(timeout_seconds: int = 120) -> dict:
         return {"email": email, "status": "success"}
 
     except Exception as e:
-        return {"error": f"Token exchange failed: {e}"}
+        if "error" not in str(type(e).__name__).lower():
+            return {"error": f"Token exchange failed: {e}"}
+        raise
+
+    finally:
+        server.shutdown()
+        server.server_close()
+        with _flow_lock:
+            _pending_flow = None
