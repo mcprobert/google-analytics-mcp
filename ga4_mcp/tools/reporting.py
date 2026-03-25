@@ -14,18 +14,15 @@
 
 """The core reporting tool for fetching GA4 data."""
 
-import os
 import sys
-import json
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
-    DateRange, Dimension, Metric, RunReportRequest, Filter, FilterExpression, FilterExpressionList,
+    DateRange, Dimension, Metric, RunReportRequest, FilterExpression,
     OrderBy, MetricAggregation
 )
 from ga4_mcp.coordinator import mcp
-
-# This global variable will be populated by the server on startup.
-PROPERTY_SCHEMA = None
+from ga4_mcp.tools.metadata import _resolve_property_id, _get_schema
+from ga4_mcp.auth import resolve_credentials
 
 def _get_smart_sorting(dimensions, metrics):
     """Determine optimal sorting strategy for relevance."""
@@ -50,7 +47,9 @@ def get_ga4_data(
     limit: int = 1000,
     estimate_only: bool = False,
     proceed_with_large_dataset: bool = False,
-    enable_aggregation: bool = True
+    enable_aggregation: bool = True,
+    property_id: str = None,
+    account: str = None
 ):
     """
     Retrieve GA4 data with built-in intelligence for better and safer results.
@@ -86,9 +85,19 @@ def get_ga4_data(
                                     warning and execute the query anyway.
         enable_aggregation: (Optional) If True, uses server-side aggregation when
                             beneficial. Defaults to True.
+        property_id: (Optional) GA4 property ID to query. Defaults to the configured property.
+                     Use list_properties() to see all available properties.
+        account: (Optional) Email of a registered OAuth account. Omit for service account.
+                 Use list_accounts() to see available accounts.
     """
-    if not PROPERTY_SCHEMA:
-        return {"error": "Schema not loaded. Please check server startup logs."}
+    pid = _resolve_property_id(property_id)
+    if not pid:
+        return {"error": "No property_id provided and no default GA4_PROPERTY_ID configured."}
+
+    try:
+        schema = _get_schema(pid, account)
+    except Exception as e:
+        return {"error": f"Failed to load schema for property '{pid}': {e}"}
 
     try:
         # --- Input Parsing and Validation ---
@@ -100,8 +109,8 @@ def get_ga4_data(
         if not parsed_metrics:
             return {"error": "Metrics list cannot be empty."}
 
-        valid_dims = PROPERTY_SCHEMA["dimensions"].keys()
-        valid_mets = PROPERTY_SCHEMA["metrics"].keys()
+        valid_dims = schema["dimensions"].keys()
+        valid_mets = schema["metrics"].keys()
         for dim in parsed_dimensions:
             if dim not in valid_dims:
                 return {"error": f"Invalid dimension: '{dim}'. Use list_dimension_categories() to see available dimensions."}
@@ -112,18 +121,14 @@ def get_ga4_data(
         # --- Filter Expression Building ---
         filter_expression = None
         if dimension_filter:
-            # The original script had a complex recursive builder. For this refactoring,
-            # we'll rely on the user passing a correctly structured dict, similar to the
-            # official google/analytics-mcp project. This simplifies the code greatly.
-            # A more robust builder can be added back later if needed.
             try:
                 filter_expression = FilterExpression(dimension_filter)
             except Exception as e:
                 return {"error": f"Invalid dimension_filter structure: {e}"}
 
         # --- API Client and Request Objects ---
-        client = BetaAnalyticsDataClient()
-        property_id = os.getenv("GA4_PROPERTY_ID")
+        creds = resolve_credentials(account)
+        client = BetaAnalyticsDataClient(credentials=creds) if creds else BetaAnalyticsDataClient()
         dimension_objects = [Dimension(name=d) for d in parsed_dimensions]
         metric_objects = [Metric(name=m) for m in parsed_metrics]
         date_range_object = DateRange(start_date=date_range_start, end_date=date_range_end)
@@ -132,7 +137,7 @@ def get_ga4_data(
         if not proceed_with_large_dataset or estimate_only:
             try:
                 estimation_req = RunReportRequest(
-                    property=f"properties/{property_id}",
+                    property=f"properties/{pid}",
                     dimensions=dimension_objects,
                     metrics=metric_objects,
                     date_ranges=[date_range_object],
@@ -161,7 +166,7 @@ def get_ga4_data(
 
         # --- Main GA4 API Call ---
         request = RunReportRequest(
-            property=f"properties/{property_id}",
+            property=f"properties/{pid}",
             dimensions=dimension_objects,
             metrics=metric_objects,
             date_ranges=[date_range_object],

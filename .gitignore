@@ -24,6 +24,11 @@ release-commands.sh
 # OS files
 Thumbs.db
 
+# Credentials and local MCP config
+docs/*.json
+.mcp.json
+.venv/
+
 # Kiro IDE files
 .kiro/
 

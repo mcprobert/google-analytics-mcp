@@ -18,13 +18,15 @@ Connect Google Analytics 4 data to AI agents, agentic workflows, and MCP clients
 
 **Built for:** AI agents, analyst copilots, and MCP runtimes across Claude, ChatGPT, Cursor, Windsurf, and custom hosts.
 
-I also built a [Google Search Console MCP](https://github.com/surendranb/google-search-console-mcp) that enables you to mix & match the data from both the sources
+**v3.0 features:** Multi-property queries, multi-account OAuth login, and interactive account switching — all from within Claude Desktop or any MCP client.
 
 </p>
 ---
 
 ## Why Agents Use This Server
 
+- **Multi-property & multi-account** — query any GA4 property across multiple Google accounts in a single session
+- **Interactive OAuth login** — agents can prompt users to authenticate new Google accounts on the fly
 - **Analysis-ready outputs** with server-side aggregation, so agents spend more time answering questions and less time wrangling rows
 - **Live schema discovery** for each GA4 property, including category-based exploration for dimensions and metrics
 - **Context-safe defaults** that estimate large datasets before they blow up a conversation or workflow
@@ -49,7 +51,7 @@ pip3 --version
 **Required:**
 - Python 3.10 or higher
 - Google Analytics 4 property with data
-- Service account with Google Analytics Data API access and GA4 property access
+- **One of:** a service account with GA4 access, or an OAuth client for interactive login
 
 ---
 
@@ -248,6 +250,51 @@ If you plan to modify the package locally, use `python -m pip install -e .` inst
 
 ---
 
+## Multi-Property & Multi-Account Usage
+
+### Querying Different Properties
+
+All tools accept an optional `property_id` parameter. If omitted, the default `GA4_PROPERTY_ID` is used:
+
+```
+Show me sessions for property 394323647 for the last 7 days
+```
+
+### Using OAuth Accounts
+
+To access properties beyond the service account's reach, register a Google account:
+
+1. The agent calls `add_account()` — returns an auth URL
+2. You click the URL and sign in with your Google account
+3. The agent calls `complete_account_login()` — completes registration
+4. Now use `account="you@example.com"` on any tool
+
+**MCP configuration with OAuth support:**
+
+```json
+{
+  "mcpServers": {
+    "ga4-analytics": {
+      "command": "python3",
+      "args": ["-m", "ga4_mcp"],
+      "env": {
+        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/service-account-key.json",
+        "GA4_PROPERTY_ID": "123456789",
+        "GA4_MCP_OAUTH_CLIENT_SECRETS": "/path/to/oauth-client-secret.json"
+      }
+    }
+  }
+}
+```
+
+**Register accounts from the terminal:**
+
+```bash
+ga4-mcp-add-account --client-secrets /path/to/oauth-client-secret.json
+```
+
+---
+
 ## Usage
 
 Once configured, ask your MCP client questions like:
@@ -361,15 +408,25 @@ get_ga4_data(
 
 ## Available Tools
 
-The server provides a suite of tools for data reporting and schema discovery.
+The server provides 12 tools for account management, property discovery, schema exploration, and data reporting. All data tools accept optional `property_id` and `account` parameters.
 
-1.  **`search_schema`** - Searches for a keyword across all available dimensions and metrics. This is the most efficient way to discover fields for a query.
-2.  **`get_ga4_data`** - Retrieve GA4 data with built-in intelligence for better and safer results (includes data volume protection, smart aggregation, and intelligent sorting).
-3.  **`list_dimension_categories`** - Lists all available dimension categories.
-4.  **`list_metric_categories`** - Lists all available metric categories.
-5.  **`get_dimensions_by_category`** - Gets all dimensions for a specific category.
-6.  **`get_metrics_by_category`** - Gets all metrics for a specific category.
-7.  **`get_property_schema`** - Returns the complete schema for the property (Warning: this can be a very large object).
+### Account & Property Management
+1.  **`list_accounts`** - Show available service account and registered OAuth accounts
+2.  **`add_account`** - Start interactive OAuth login (returns URL for user to click)
+3.  **`complete_account_login`** - Complete OAuth login after user authenticates in browser
+4.  **`remove_registered_account`** - Remove a registered OAuth account
+5.  **`list_properties`** - List all GA4 properties accessible by a given account
+
+### Schema Discovery
+6.  **`search_schema`** - Search for dimensions and metrics by keyword (most efficient discovery method)
+7.  **`get_property_schema`** - Returns the complete schema for a property (Warning: large object)
+8.  **`list_dimension_categories`** - Lists all available dimension categories
+9.  **`list_metric_categories`** - Lists all available metric categories
+10. **`get_dimensions_by_category`** - Gets all dimensions for a specific category
+11. **`get_metrics_by_category`** - Gets all metrics for a specific category
+
+### Data Reporting
+12. **`get_ga4_data`** - Retrieve GA4 data with smart features (data volume protection, server-side aggregation, intelligent sorting)
 
 ---
 
@@ -443,10 +500,14 @@ python -m pip install --user google-analytics-mcp
 google-analytics-mcp/
 ├── ga4_mcp/                # Main package directory
 │   ├── server.py           # Core server logic
-│   ├── coordinator.py      # MCP instance
-│   └── tools/              # Tool definitions (reporting, metadata)
-├── pyproject.toml          # Package configuration for PyPI
-├── requirements.txt        # Dependencies for local dev
+│   ├── coordinator.py      # MCP singleton instance
+│   ├── auth.py             # Multi-account credential management
+│   ├── add_account.py      # CLI for interactive OAuth registration
+│   └── tools/              # Tool definitions
+│       ├── metadata.py     # Schema discovery & account management tools
+│       └── reporting.py    # Data retrieval tool with smart features
+├── scripts/                # Utility scripts
+├── pyproject.toml          # Package configuration
 ├── README.md               # This file
 └── ...
 ```

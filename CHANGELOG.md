@@ -7,9 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-03-25
+
+### Added
+- **Multi-property support**: All tools now accept an optional `property_id` parameter to query any accessible GA4 property without restarting the server
+- **Multi-account OAuth**: Register multiple Google accounts via interactive OAuth flow; use the `account` parameter on any tool to switch between them
+- **New tools**:
+  - `list_accounts` — show available service account and registered OAuth accounts
+  - `add_account` / `complete_account_login` — two-step interactive OAuth registration, usable from Claude Desktop
+  - `remove_registered_account` — remove a previously registered OAuth account
+  - `list_properties` — discover all GA4 properties accessible by a given account
+- **Per-property schema caching**: schemas are fetched on first use per property and cached for the session
+- `google-analytics-admin` and `google-auth-oauthlib` added as dependencies
+- `ga4-mcp-add-account` CLI entry point for terminal-based account registration
+- `GA4_MCP_OAUTH_CLIENT_SECRETS` environment variable for OAuth client configuration
+
 ### Changed
-- Refreshed public-facing copy to position the project around AI agents and agentic workflows rather than IDE-specific integrations
-- Updated GitHub Actions workflow dependencies to the latest major versions to stay ahead of the Node 20 deprecation on GitHub-hosted runners
+- `GA4_PROPERTY_ID` is now optional (used as default; can be overridden per tool call)
+- `GOOGLE_APPLICATION_CREDENTIALS` is now optional when OAuth accounts are registered
+- Server startup no longer exits fatally if the default property schema fails to load
+- Schema caching moved from module-level globals to a shared `SCHEMA_CACHE` dict in metadata module
+
+### Removed
+- Single-property-only limitation — all tools now support cross-property queries
 
 ## [2.0.1] - 2026-03-12
 

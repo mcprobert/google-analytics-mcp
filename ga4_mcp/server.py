@@ -16,11 +16,7 @@ import os
 import sys
 from .coordinator import mcp
 from .tools import metadata, reporting
-
-# --- Globals ---
-# In-memory cache for the property's metadata (dimensions and metrics).
-# This is populated once on server startup to avoid repeated API calls.
-PROPERTY_SCHEMA = None
+from .auth import list_registered_accounts
 
 def main():
     """
@@ -28,53 +24,39 @@ def main():
 
     This function performs the following steps:
     1. Validates required environment variables.
-    2. Fetches and caches the GA4 property schema (dimensions and metrics).
-    3. Registers the tools with the MCP server.
+    2. If a default GA4_PROPERTY_ID is set, fetches and caches its schema.
+    3. Discovers registered OAuth accounts.
     4. Starts the server and listens for requests.
     """
     print("Starting GA4 MCP server...", file=sys.stderr)
 
-    # 1. Validate environment variables
+    # 1. Validate credentials (service account is optional if OAuth accounts exist)
     credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     property_id = os.getenv("GA4_PROPERTY_ID")
 
-    if not credentials_path:
-        print("ERROR: GOOGLE_APPLICATION_CREDENTIALS environment variable not set.", file=sys.stderr)
-        print("Please set it to the path of your service account JSON file.", file=sys.stderr)
-        sys.exit(1)
+    if credentials_path and not os.path.exists(credentials_path):
+        print(f"WARNING: Credentials file not found at '{credentials_path}'.", file=sys.stderr)
 
-    if not property_id:
-        print("ERROR: GA4_PROPERTY_ID environment variable not set.", file=sys.stderr)
-        print("Please set it to your GA4 property ID (e.g., '123456789').", file=sys.stderr)
-        sys.exit(1)
+    # 2. Set default property ID and pre-cache its schema if provided
+    metadata.DEFAULT_PROPERTY_ID = property_id
 
-    if not os.path.exists(credentials_path):
-        print(f"ERROR: Credentials file not found at '{credentials_path}'.", file=sys.stderr)
-        print("Please check the GOOGLE_APPLICATION_CREDENTIALS path.", file=sys.stderr)
-        sys.exit(1)
+    if property_id:
+        print(f"Default property: {property_id}", file=sys.stderr)
+        try:
+            metadata._get_schema(property_id)
+        except Exception as e:
+            print(f"WARNING: Could not fetch schema for default property '{property_id}': {e}", file=sys.stderr)
+            print("Schema will be fetched on first tool call.", file=sys.stderr)
+    else:
+        print("No default GA4_PROPERTY_ID set. Property ID must be provided on each tool call.", file=sys.stderr)
 
-    # 2. Fetch and cache the GA4 property schema
-    print(f"Fetching schema for property '{property_id}'...", file=sys.stderr)
-    global PROPERTY_SCHEMA
-    try:
-        PROPERTY_SCHEMA = metadata.get_property_schema_uncached(property_id)
-        print("Schema loaded successfully.", file=sys.stderr)
-    except Exception as e:
-        print(f"FATAL: Could not fetch GA4 property schema: {e}", file=sys.stderr)
-        print("Please ensure the service account has 'Viewer' permissions on the GA4 property and the Data API is enabled.", file=sys.stderr)
-        sys.exit(1)
+    # 3. Discover registered OAuth accounts
+    oauth_accounts = list_registered_accounts()
+    if oauth_accounts:
+        print(f"Registered OAuth accounts: {', '.join(a['email'] for a in oauth_accounts)}", file=sys.stderr)
+    else:
+        print("No OAuth accounts registered. Use 'python -m ga4_mcp.add_account' to add one.", file=sys.stderr)
 
-    # 3. Register tools
-    # Tools are defined in other modules and decorated with @mcp.tool().
-    # Importing them here makes them available to the server.
-    # We pass the schema to the modules that need it.
-    metadata.PROPERTY_SCHEMA = PROPERTY_SCHEMA
-    reporting.PROPERTY_SCHEMA = PROPERTY_SCHEMA
-    
     # 4. Run the server
+    print("GA4 MCP server ready.", file=sys.stderr)
     mcp.run(transport="stdio")
-
-# Note: The actual tool definitions are in the .tools sub-package.
-# The `if __name__ == "__main__"` block is not needed here, as the
-# entry point is handled by `pyproject.toml` [project.scripts].
-# For local development, you can run `python -m ga4_mcp.server`.
