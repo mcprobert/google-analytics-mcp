@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Grant the GA4 MCP service account Viewer access to all GA4 accounts
+Grant a service account Viewer access to all GA4 accounts
 accessible by the authenticated user.
 
 Usage:
-    python scripts/grant_access_all_accounts.py
+    python scripts/grant_access_all_accounts.py \
+        --client-secrets /path/to/oauth-client-secret.json \
+        --service-account-email sa@project.iam.gserviceaccount.com
 
 This will open a browser for Google OAuth login, then iterate through
 all GA accounts and add the service account as a Viewer.
 """
 
+import argparse
 import sys
-from pathlib import Path
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.analytics.admin_v1alpha import AnalyticsAdminServiceClient
@@ -22,27 +24,38 @@ from google.analytics.admin_v1alpha.types import (
     ListAccessBindingsRequest,
 )
 
-ROOT = Path(__file__).resolve().parents[1]
-
-OAUTH_CLIENT_SECRET = ROOT / "docs" / "client_secret_355080528088-n58clrv4038i8m9mvq8ot4f6co769m3m.apps.googleusercontent.com.json"
-SERVICE_ACCOUNT_EMAIL = "ga4-mcp-reader@ga-mcp-server-491313.iam.gserviceaccount.com"
-
 SCOPES = [
     "https://www.googleapis.com/auth/analytics.manage.users",
     "https://www.googleapis.com/auth/analytics.readonly",
+    "openid",
 ]
 
 
-def authenticate():
+def authenticate(client_secrets_path: str):
     """Run OAuth flow and return credentials."""
-    flow = InstalledAppFlow.from_client_secrets_file(str(OAUTH_CLIENT_SECRET), scopes=SCOPES)
+    flow = InstalledAppFlow.from_client_secrets_file(client_secrets_path, scopes=SCOPES)
     creds = flow.run_local_server(port=0)
     return creds
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Grant a service account Viewer access to all GA4 accounts"
+    )
+    parser.add_argument(
+        "--client-secrets",
+        required=True,
+        help="Path to OAuth client secrets JSON file",
+    )
+    parser.add_argument(
+        "--service-account-email",
+        required=True,
+        help="Service account email to grant access to (e.g. sa@project.iam.gserviceaccount.com)",
+    )
+    args = parser.parse_args()
+
     print("Authenticating via browser...")
-    creds = authenticate()
+    creds = authenticate(args.client_secrets)
 
     client = AnalyticsAdminServiceClient(credentials=creds)
 
@@ -57,7 +70,7 @@ def main():
     for account in accounts:
         print(f"  {account.display_name} ({account.name})")
 
-    print(f"\nGranting Viewer access to: {SERVICE_ACCOUNT_EMAIL}\n")
+    print(f"\nGranting Viewer access to: {args.service_account_email}\n")
 
     granted = 0
     skipped = 0
@@ -70,20 +83,19 @@ def main():
                 request=ListAccessBindingsRequest(parent=account.name)
             ))
             already_has_access = any(
-                b.user == SERVICE_ACCOUNT_EMAIL for b in existing
+                b.user == args.service_account_email for b in existing
             )
             if already_has_access:
                 print(f"  SKIP  {account.display_name} - already has access")
                 skipped += 1
                 continue
-        except Exception as e:
-            # If we can't list bindings, try to create anyway
+        except Exception:
             pass
 
         # Grant access
         try:
             binding = AccessBinding(
-                user=SERVICE_ACCOUNT_EMAIL,
+                user=args.service_account_email,
                 roles=["predefinedRoles/viewer"],
             )
             client.create_access_binding(
