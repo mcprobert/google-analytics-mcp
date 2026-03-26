@@ -48,15 +48,22 @@ def _write_private_json(path: Path, payload: dict) -> None:
 
 
 def _get_oauth_client_config() -> dict:
-    """Load OAuth client config from the configured path."""
+    """Load OAuth client config from env var, falling back to embedded defaults.
+
+    Priority:
+    1. GA4_MCP_OAUTH_CLIENT_SECRETS env var (path to JSON file)
+    2. Embedded client credentials from default_client.py
+    """
     path = os.getenv("GA4_MCP_OAUTH_CLIENT_SECRETS")
-    if not path:
-        return None
-    path = Path(path)
-    if not path.exists():
-        return None
-    data = json.loads(path.read_text())
-    return data.get("installed") or data.get("web")
+    if path:
+        path = Path(path)
+        if path.exists():
+            data = json.loads(path.read_text())
+            return data.get("installed") or data.get("web")
+
+    # Fall back to embedded client credentials
+    from ga4_mcp.default_client import get_default_client_config
+    return get_default_client_config()
 
 
 def get_accounts_dir() -> Path:
@@ -243,8 +250,9 @@ def start_oauth_flow() -> dict:
 
     client_config = _get_oauth_client_config()
     if not client_config:
-        return {"error": "GA4_MCP_OAUTH_CLIENT_SECRETS environment variable not set or file not found. "
-                         "Set it to the path of your OAuth client secrets JSON file."}
+        return {"error": "OAuth client credentials not available. "
+                         "Either set GA4_MCP_OAUTH_CLIENT_SECRETS to a client secrets JSON file, "
+                         "or ensure the package has embedded client credentials configured."}
 
     client_id = client_config["client_id"]
     client_secret = client_config["client_secret"]

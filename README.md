@@ -18,7 +18,7 @@ Connect Google Analytics 4 data to AI agents, agentic workflows, and MCP clients
 
 **Built for:** AI agents, analyst copilots, and MCP runtimes across Claude, ChatGPT, Cursor, Windsurf, and custom hosts.
 
-**v3.0 features:** Multi-property queries, multi-account OAuth login, and interactive account switching — all from within Claude Desktop or any MCP client.
+**v3.1 features:** Zero-config OAuth login — just install and sign in with your Google account. Multi-property queries, multi-account support, and interactive account switching from any MCP client.
 
 </p>
 ---
@@ -51,91 +51,11 @@ pip3 --version
 **Required:**
 - Python 3.10 or higher
 - Google Analytics 4 property with data
-- **One of:** a service account with GA4 access, or an OAuth client for interactive login
+- A Google account with access to the GA4 property (Viewer role or above)
 
 ---
 
-## Step 1: Setup Google Analytics Credentials
-
-### Create Service Account in Google Cloud Console
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. **Create or select a project**:
-   - New project: Click "New Project" → Enter project name → Create
-   - Existing project: Select from dropdown
-3. **Enable the Analytics APIs**:
-   - Go to "APIs & Services" → "Library"
-   - Search for "Google Analytics Data API" → Click "Enable"
-4. **Create Service Account**:
-   - Go to "APIs & Services" → "Credentials"
-   - Click "Create Credentials" → "Service Account"
-   - Enter name (e.g., "ga4-mcp-server")
-   - Click "Create and Continue"
-   - Skip role assignment → Click "Done"
-5. **Download JSON Key**:
-   - Click your service account
-   - Go to "Keys" tab → "Add Key" → "Create New Key"
-   - Select "JSON" → Click "Create"
-   - Save the JSON file - you'll need its path
-
-### Add Service Account to GA4
-
-1. **Get service account email**:
-   - Open the JSON file
-   - Find the `client_email` field
-   - Copy the email (format: `ga4-mcp-server@your-project.iam.gserviceaccount.com`)
-2. **Add to GA4 property**:
-   - Go to [Google Analytics](https://analytics.google.com/)
-   - Select your GA4 property
-   - Click "Admin" (gear icon at bottom left)
-   - Under "Property" → Click "Property access management"
-   - Click "+" → "Add users"
-   - Paste the service account email
-   - Select "Viewer" role
-   - Uncheck "Notify new users by email"
-   - Click "Add"
-
-### Find Your GA4 Property ID
-
-1. In [Google Analytics](https://analytics.google.com/), select your property
-2. Click "Admin" (gear icon)
-3. Under "Property" → Click "Property details"
-4. Copy the **Property ID** (numeric, e.g., `123456789`)
-   - **Note**: This is different from the "Measurement ID" (starts with G-)
-
-### Test Your Setup (Optional)
-
-Verify your credentials:
-
-```bash
-pip install google-analytics-data
-```
-
-Create a test script (`test_ga4.py`):
-
-```python
-import os
-from google.analytics.data_v1beta import BetaAnalyticsDataClient
-
-# Set credentials path
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/path/to/your/service-account-key.json"
-
-# Test connection
-client = BetaAnalyticsDataClient()
-print("✅ GA4 credentials working!")
-```
-
-Run the test:
-
-```bash
-python test_ga4.py
-```
-
-If you see "✅ GA4 credentials working!" you're ready to proceed.
-
----
-
-## Step 2: Install the MCP Server
+## Step 1: Install the MCP Server
 
 There are two supported ways to launch the server:
 
@@ -162,11 +82,7 @@ Use this when `ga4-mcp-server` is available on your `PATH`:
 {
   "mcpServers": {
     "ga4-analytics": {
-      "command": "ga4-mcp-server",
-      "env": {
-        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/your/service-account-key.json",
-        "GA4_PROPERTY_ID": "123456789"
-      }
+      "command": "ga4-mcp-server"
     }
   }
 }
@@ -174,41 +90,27 @@ Use this when `ga4-mcp-server` is available on your `PATH`:
 
 #### Option 2: Use an explicit Python interpreter
 
-Use this when you want to pin the exact Python runtime or when the console script is not on your `PATH`.
-
-If `python3 --version` worked:
+Use this when you want to pin the exact Python runtime or when the console script is not on your `PATH`:
 
 ```json
 {
   "mcpServers": {
     "ga4-analytics": {
       "command": "python3",
-      "args": ["-m", "ga4_mcp"],
-      "env": {
-        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/your/service-account-key.json",
-        "GA4_PROPERTY_ID": "123456789"
-      }
+      "args": ["-m", "ga4_mcp"]
     }
   }
 }
 ```
 
-If `python --version` worked:
+**That's it!** On first use, the agent will prompt you to sign in with your Google account via the `add_account` tool. No service account or environment variables needed.
 
-```json
-{
-  "mcpServers": {
-    "ga4-analytics": {
-      "command": "python",
-      "args": ["-m", "ga4_mcp"],
-      "env": {
-        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/your/service-account-key.json",
-        "GA4_PROPERTY_ID": "123456789"
-      }
-    }
-  }
-}
-```
+**Optional environment variables** (for advanced setups):
+
+| Variable | Description |
+|---|---|
+| `GA4_PROPERTY_ID` | Default numeric GA4 property ID (avoids passing it on every tool call) |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to a service account JSON key (alternative to OAuth login) |
 
 ### Method B: Install from a local clone
 
@@ -229,11 +131,7 @@ If you plan to modify the package locally, use `python -m pip install -e .` inst
   "mcpServers": {
     "ga4-analytics": {
       "command": "/full/path/to/google-analytics-mcp/.venv/bin/python",
-      "args": ["-m", "ga4_mcp"],
-      "env": {
-        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/your/service-account-key.json",
-        "GA4_PROPERTY_ID": "123456789"
-      }
+      "args": ["-m", "ga4_mcp"]
     }
   }
 }
@@ -241,12 +139,21 @@ If you plan to modify the package locally, use `python -m pip install -e .` inst
 
 ---
 
-## Step 3: Update Configuration
+## Step 2: Sign In With Your Google Account
 
-**Replace these placeholders in your MCP configuration:**
-- `/path/to/your/service-account-key.json` with the absolute path to your JSON key
-- `123456789` with your numeric GA4 Property ID
-- `/full/path/to/google-analytics-mcp/.venv/bin/python` with your virtual environment's Python path (Method B only)
+On first use, sign in so the server can access your GA4 data. You can do this two ways:
+
+**From your MCP client (recommended):** Ask the agent to add an account — it will call the `add_account` tool and present a Google sign-in URL. Click it, sign in, and you're done.
+
+**From the terminal:**
+
+```bash
+ga4-mcp-add-account
+```
+
+This opens your browser for Google login. Once authenticated, the account is stored locally and available on every future server start.
+
+You can register multiple Google accounts and switch between them using the `account` parameter on any tool.
 
 ---
 
@@ -260,38 +167,15 @@ All tools accept an optional `property_id` parameter. If omitted, the default `G
 Show me sessions for property 394323647 for the last 7 days
 ```
 
-### Using OAuth Accounts
+### Switching Accounts
 
-To access properties beyond the service account's reach, register a Google account:
+Register additional Google accounts with `add_account`, then use the `account` parameter:
 
-1. The agent calls `add_account()` — returns an auth URL
-2. You click the URL and sign in with your Google account
-3. The agent calls `complete_account_login()` — completes registration
-4. Now use `account="you@example.com"` on any tool
-
-**MCP configuration with OAuth support:**
-
-```json
-{
-  "mcpServers": {
-    "ga4-analytics": {
-      "command": "python3",
-      "args": ["-m", "ga4_mcp"],
-      "env": {
-        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/service-account-key.json",
-        "GA4_PROPERTY_ID": "123456789",
-        "GA4_MCP_OAUTH_CLIENT_SECRETS": "/path/to/oauth-client-secret.json"
-      }
-    }
-  }
-}
+```
+Show me traffic for property 123456789 using account alice@company.com
 ```
 
-**Register accounts from the terminal:**
-
-```bash
-ga4-mcp-add-account --client-secrets /path/to/oauth-client-secret.json
-```
+Use `list_accounts` to see all registered accounts and `list_properties` to discover which GA4 properties each account can access.
 
 ---
 
@@ -502,6 +386,7 @@ google-analytics-mcp/
 │   ├── server.py           # Core server logic
 │   ├── coordinator.py      # MCP singleton instance
 │   ├── auth.py             # Multi-account credential management
+│   ├── default_client.py   # Embedded OAuth client credentials
 │   ├── add_account.py      # CLI for interactive OAuth registration
 │   └── tools/              # Tool definitions
 │       ├── metadata.py     # Schema discovery & account management tools

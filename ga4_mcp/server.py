@@ -59,8 +59,10 @@ def main():
     oauth_accounts = list_registered_accounts()
     if oauth_accounts:
         print(f"Registered OAuth accounts: {', '.join(a['email'] for a in oauth_accounts)}", file=sys.stderr)
+    elif not credentials_path:
+        print("No accounts configured. Use the add_account tool to sign in with your Google account.", file=sys.stderr)
     else:
-        print("No OAuth accounts registered. Use 'python -m ga4_mcp.add_account' to add one.", file=sys.stderr)
+        print("No OAuth accounts registered. Use the add_account tool or run 'ga4-mcp-add-account' to add one.", file=sys.stderr)
 
     # 4. Run the server
     print("GA4 MCP server ready.", file=sys.stderr)

@@ -54,11 +54,11 @@ else:
         errors.append(
             f"server.json package version {package.get('version')} does not match pyproject.toml version {version}"
         )
-    expected_env_names = ["GOOGLE_APPLICATION_CREDENTIALS", "GA4_PROPERTY_ID", "GA4_MCP_OAUTH_CLIENT_SECRETS"]
+    expected_env_names = ["GOOGLE_APPLICATION_CREDENTIALS", "GA4_PROPERTY_ID"]
     actual_env_names = [item.get("name") for item in package.get("environment_variables", [])]
     if actual_env_names != expected_env_names:
         errors.append(
-            "server.json environment variables must be GOOGLE_APPLICATION_CREDENTIALS, GA4_PROPERTY_ID, GA4_MCP_OAUTH_CLIENT_SECRETS"
+            "server.json environment variables must be GOOGLE_APPLICATION_CREDENTIALS, GA4_PROPERTY_ID"
         )
 
 if "[describe what your server does]" in server.get("description", ""):

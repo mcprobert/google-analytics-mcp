@@ -7,13 +7,13 @@
     "url": "https://github.com/surendranb/google-analytics-mcp",
     "source": "github"
   },
-  "version": "3.0.1",
+  "version": "3.1.0",
   "packages": [
     {
       "registry_type": "pypi",
       "registry_base_url": "https://pypi.org",
       "identifier": "google-analytics-mcp",
-      "version": "3.0.1",
+      "version": "3.1.0",
       "transport": {
         "type": "stdio"
       },
@@ -31,13 +31,6 @@
           "format": "string",
           "is_secret": false,
           "name": "GA4_PROPERTY_ID"
-        },
-        {
-          "description": "Path to OAuth client secrets JSON for interactive account login via add_account tool.",
-          "is_required": false,
-          "format": "string",
-          "is_secret": true,
-          "name": "GA4_MCP_OAUTH_CLIENT_SECRETS"
         }
       ]
     }

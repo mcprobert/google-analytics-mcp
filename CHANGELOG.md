@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-03-26
+
+### Added
+- **Zero-config OAuth login**: Embedded OAuth client credentials so users can sign in with their Google account without needing their own Google Cloud project or client secrets file
+- `ga4_mcp/default_client.py` module holding the shared OAuth client configuration
+
+### Changed
+- `add_account` MCP tool no longer requires `GA4_MCP_OAUTH_CLIENT_SECRETS` environment variable
+- `ga4-mcp-add-account` CLI no longer requires `--client-secrets` flag (now optional override)
+- `_get_oauth_client_config()` falls back to embedded credentials when env var is not set
+- Simplified server startup messaging for first-run experience
+- `GA4_MCP_OAUTH_CLIENT_SECRETS` removed from `server.json` environment variables (still supported as override)
+
 ## [3.0.1] - 2026-03-25
 
 ### Fixed

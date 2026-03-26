@@ -99,7 +99,7 @@ def list_accounts():
     """
     List all available accounts that can be used with the 'account' parameter.
     Returns default credentials (if available) and any registered OAuth user accounts.
-    Register new accounts by running: python -m ga4_mcp.add_account --client-secrets <path>
+    Register new accounts using the add_account tool or by running: ga4-mcp-add-account
     """
     accounts = []
     if has_default_credentials():
@@ -118,8 +118,6 @@ def add_account():
 
     After showing the URL, immediately call complete_account_login() which will
     wait for the user to finish authenticating.
-
-    Requires GA4_MCP_OAUTH_CLIENT_SECRETS env var to be set.
     """
     result = start_oauth_flow()
     if "error" in result:

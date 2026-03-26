@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Google Analytics 4 MCP server (v3.0.1) — gives AI agents analysis-ready GA4 access with multi-property queries, multi-account OAuth, schema discovery, server-side aggregation, and smart defaults. Fork of surendranb/google-analytics-mcp. Built on FastMCP. Python 3.10+, Apache-2.0 license.
+Google Analytics 4 MCP server (v3.1.0) — gives AI agents analysis-ready GA4 access with zero-config OAuth login, multi-property queries, multi-account support, schema discovery, server-side aggregation, and smart defaults. Fork of surendranb/google-analytics-mcp. Built on FastMCP. Python 3.10+, Apache-2.0 license.
 
 ## Commands
 
@@ -16,18 +16,17 @@ pip install -e .
 
 ### Run
 ```bash
-# Requires at least GOOGLE_APPLICATION_CREDENTIALS or a registered OAuth account
-export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
-export GA4_PROPERTY_ID="123456789"          # optional default
-export GA4_MCP_OAUTH_CLIENT_SECRETS="/path/to/oauth-client-secret.json"  # optional
-
 ga4-mcp-server          # console script entry point
 python -m ga4_mcp       # alternative
+
+# Optional env vars for advanced setups:
+export GA4_PROPERTY_ID="123456789"          # optional default property
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"  # optional, alternative to OAuth
 ```
 
 ### Register an OAuth account (terminal)
 ```bash
-ga4-mcp-add-account --client-secrets /path/to/oauth-client-secret.json
+ga4-mcp-add-account     # uses built-in OAuth credentials
 ```
 
 ### Build
@@ -54,8 +53,10 @@ Tests are manual scenarios in `test_cases.md`. CI validates imports and package 
 
 ### Credential management (`auth.py`)
 Two credential types:
-- **Service account**: via `GOOGLE_APPLICATION_CREDENTIALS` env var (default, used when no `account` param)
-- **OAuth accounts**: refresh tokens stored in `~/.config/ga4-mcp/accounts/{email}.json`
+- **OAuth accounts** (primary): refresh tokens stored in `~/.config/ga4-mcp/accounts/{email}.json`. Uses embedded OAuth client credentials from `default_client.py` — no env vars needed.
+- **Service account** (optional): via `GOOGLE_APPLICATION_CREDENTIALS` env var, used when no `account` param is specified.
+
+`_get_oauth_client_config()` checks `GA4_MCP_OAUTH_CLIENT_SECRETS` env var first, then falls back to embedded credentials in `default_client.py`.
 
 `resolve_credentials(account)` returns credentials for a specific account or `None` for service account default. All API clients accept these credentials.
 
