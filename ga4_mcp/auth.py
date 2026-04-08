@@ -25,12 +25,19 @@ ACCOUNTS_DIR = Path.home() / ".config" / "ga4-mcp" / "accounts"
 # In-memory cache of loaded credentials: {email: google.oauth2.credentials.Credentials}
 _credentials_cache = {}
 
-SCOPES = [
+READ_SCOPES = [
     "https://www.googleapis.com/auth/analytics.readonly",
     "https://www.googleapis.com/auth/analytics.manage.users.readonly",
     "https://www.googleapis.com/auth/userinfo.email",
     "openid",
 ]
+EDIT_SCOPES = [
+    "https://www.googleapis.com/auth/analytics.edit",
+]
+# New registrations request the full scope set. Existing refresh tokens granted only
+# the read scopes continue to work for read tools; write tools gate on granted_scopes.
+SCOPES = READ_SCOPES + EDIT_SCOPES
+EDIT_SCOPE = EDIT_SCOPES[0]
 
 # Pending OAuth flow state, guarded by _flow_lock
 _pending_flow = None
@@ -38,13 +45,32 @@ _flow_lock = threading.Lock()
 
 
 def _write_private_json(path: Path, payload: dict) -> None:
-    """Write JSON to a file with restrictive permissions (0o600)."""
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-        f.write("\n")
-    if os.name != "nt":
-        os.chmod(str(path), 0o600)
+    """Atomically write JSON to a file with restrictive permissions (0o600).
+
+    Writes to a temp sibling file first, then os.replace()s into place. os.replace
+    is atomic on POSIX and atomic on Windows 10+ for same-volume renames, so
+    readers (including save_oauth_credentials's cache-pop path) never observe a
+    partially-written file. On failure, the original file is left intact and the
+    temp file is cleaned up.
+    """
+    tmp_path = path.with_name(path.name + ".tmp")
+    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+        if os.name != "nt":
+            os.chmod(str(tmp_path), 0o600)
+        os.replace(str(tmp_path), str(path))
+    except Exception:
+        # Best-effort cleanup of the tmp file. FileNotFoundError is expected if
+        # os.open raised before creating the file; other OSErrors (permission,
+        # disk full on unlink itself) propagate as the original exception would.
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _get_oauth_client_config() -> dict:
@@ -114,11 +140,27 @@ def has_default_credentials() -> bool:
 
 
 def get_oauth_credentials(email: str) -> Credentials:
-    """Load OAuth credentials for a registered account, refreshing if needed."""
-    if email in _credentials_cache:
-        creds = _credentials_cache[email]
-        if creds.valid:
-            return creds
+    """Load OAuth credentials for a registered account, refreshing if needed.
+
+    Does NOT attempt to backfill granted_scopes for legacy (schema-v1) account files.
+    After constructing Credentials with scopes=SCOPES, the post-refresh value of
+    creds.scopes is not a reliable indicator of what Google actually granted — the
+    refresh response's `scope` field is optional and may be absent. Trying to infer
+    granted scopes from creds.scopes risks falsely reporting edit access on a
+    read-only account. Legacy accounts therefore remain schema-v1 until the user
+    re-runs `ga4-mcp-add-account` (or the add_account MCP tool), which writes the
+    authoritative granted_scopes from the token-exchange response.
+    """
+    # dict.get() is atomic under CPython's GIL / per-dict lock — do NOT split
+    # into `in` + subscript, that re-introduces a TOCTOU race with
+    # save_oauth_credentials's cache pop when FastMCP runs sync tools on a
+    # thread pool. TODO: coalesce concurrent refreshes — two cache misses on
+    # the same email currently trigger two simultaneous token exchanges against
+    # Google. Benign today (Google tolerates duplicate refresh_token grants)
+    # but would break under any future refresh-token rotation scheme.
+    cached = _credentials_cache.get(email)
+    if cached is not None and cached.valid:
+        return cached
 
     token_file = _safe_account_path(email)
     if not token_file.exists():
@@ -128,13 +170,28 @@ def get_oauth_credentials(email: str) -> Credentials:
         )
 
     data = json.loads(token_file.read_text())
+    # CRITICAL: do NOT pass scopes=SCOPES here.
+    #
+    # SCOPES includes analytics.edit (added in v3.2.0). google-auth's
+    # reauth.refresh_grant sends `scope=<space-joined>` in the refresh POST body
+    # whenever creds.scopes is truthy (google-auth 2.40.0, oauth2/reauth.py line
+    # ~40 and oauth2/_client.py line 500). Per RFC 6749 §6 and Google's token
+    # endpoint, requesting any scope NOT in the original grant is rejected with
+    # `invalid_scope` — which means a legacy v3.1.0 account (granted only the
+    # read scopes) would have every refresh fail on upgrade, breaking even
+    # read-only tools.
+    #
+    # Pass the PERSISTED grant (schema-v2 accounts) or None (schema-v1 legacy
+    # accounts). None omits the scope parameter entirely, so Google returns
+    # whatever scopes the refresh token was originally authorized for.
+    persisted_scopes = data.get("granted_scopes") or None
     creds = Credentials(
         token=None,
         refresh_token=data["refresh_token"],
         client_id=data["client_id"],
         client_secret=data["client_secret"],
         token_uri=data.get("token_uri", "https://oauth2.googleapis.com/token"),
-        scopes=SCOPES,
+        scopes=persisted_scopes,
     )
 
     from google.auth.transport.requests import Request
@@ -144,8 +201,20 @@ def get_oauth_credentials(email: str) -> Credentials:
     return creds
 
 
-def save_oauth_credentials(email: str, refresh_token: str, client_id: str, client_secret: str):
-    """Save OAuth credentials for an account with restrictive file permissions."""
+def save_oauth_credentials(
+    email: str,
+    refresh_token: str,
+    client_id: str,
+    client_secret: str,
+    granted_scopes: list = None,
+):
+    """Save OAuth credentials for an account with restrictive file permissions.
+
+    Args:
+        granted_scopes: The scopes Google actually granted (from the token response `scope`
+            field). When None/empty, the on-disk file omits `granted_scopes` entirely and
+            the account is treated as legacy/read-only by `ensure_edit_scope`.
+    """
     token_file = _safe_account_path(email)
     data = {
         "email": email,
@@ -153,8 +222,16 @@ def save_oauth_credentials(email: str, refresh_token: str, client_id: str, clien
         "client_id": client_id,
         "client_secret": client_secret,
         "token_uri": "https://oauth2.googleapis.com/token",
+        "schema_version": 2,
     }
+    if granted_scopes:
+        data["granted_scopes"] = list(granted_scopes)
     _write_private_json(token_file, data)
+    # Invalidate any in-memory cached credential for this email so the next call
+    # rereads the JSON file and picks up the new refresh token / scope grant. Without
+    # this, re-auth inside a running server process is a no-op until the cached token
+    # expires naturally.
+    _credentials_cache.pop(email, None)
     print(f"Credentials saved to {token_file}", file=sys.stderr)
 
 
@@ -180,6 +257,115 @@ def remove_account(email: str) -> bool:
         _credentials_cache.pop(email, None)
         return True
     return False
+
+
+def get_granted_scopes(email: str) -> list:
+    """Read granted_scopes from an account's stored token file.
+
+    Returns an empty list for legacy accounts (schema v1, no granted_scopes field) or
+    accounts that do not exist. Does NOT raise — callers use the empty list to decide
+    whether the account has any particular scope.
+    """
+    try:
+        token_file = _safe_account_path(email)
+    except ValueError:
+        return []
+    if not token_file.exists():
+        return []
+    try:
+        data = json.loads(token_file.read_text())
+    except Exception:
+        return []
+    return list(data.get("granted_scopes") or [])
+
+
+def ensure_edit_scope(account: str = None):
+    """Verify that an account has the analytics.edit scope.
+
+    Returns None on success (account has the scope). Returns an error dict on failure
+    that write tools should return directly to the caller — never raise.
+    """
+    if not account:
+        return {
+            "error": "Write tools require an OAuth account — service account / ADC cannot be scope-checked.",
+            "required_scope": EDIT_SCOPE,
+            "remediation": (
+                "Pass account=\"user@example.com\" on the tool call. Register an OAuth "
+                "account via the add_account MCP tool or run `ga4-mcp-add-account` in a terminal."
+            ),
+        }
+
+    # Explicit corrupt-file detection BEFORE get_granted_scopes, which
+    # silently swallows JSONDecodeError and returns [] — that would make
+    # us report "legacy registration" for what is actually a file-
+    # corruption problem, wasting audit time on the wrong remediation.
+    # get_granted_scopes stays simple because list_accounts uses it for
+    # display (returning [] is fine there; the user sees can_edit: False).
+    try:
+        token_file = _safe_account_path(account)
+    except ValueError as e:
+        return {
+            "error": f"Invalid account identifier '{account}': {e}",
+            "required_scope": EDIT_SCOPE,
+            "account": account,
+        }
+    if token_file.exists():
+        try:
+            json.loads(token_file.read_text())
+        except json.JSONDecodeError as e:
+            return {
+                "error": (
+                    f"Credential file for '{account}' is corrupt or unreadable: {e}. "
+                    f"Re-register via the add_account MCP tool."
+                ),
+                "required_scope": EDIT_SCOPE,
+                "account": account,
+                "exception_type": "JSONDecodeError",
+            }
+        except OSError as e:
+            return {
+                "error": f"Failed to read credential file for '{account}': {e}",
+                "required_scope": EDIT_SCOPE,
+                "account": account,
+            }
+
+    granted = get_granted_scopes(account)
+    if not granted:
+        # Either the file is missing, unreadable, or it's a legacy v1 file with no
+        # granted_scopes field. We cannot prove edit access — force re-auth.
+        return {
+            "error": (
+                f"Account '{account}' has no recorded scope grants (legacy registration "
+                f"or unknown account). Cannot use write tools until the account is re-authorized."
+            ),
+            "required_scope": EDIT_SCOPE,
+            "account": account,
+            "granted_scopes": granted,
+            "remediation": (
+                "Re-authorize the account: call the add_account MCP tool and sign in with "
+                "the SAME Google account. Google's include_granted_scopes flag means any "
+                "scopes you previously granted are preserved. If you prefer the terminal, "
+                "run `ga4-mcp-add-account` — in that case you must RESTART the MCP server "
+                "afterwards so it picks up the new credentials (the in-process credential "
+                "cache is per-process)."
+            ),
+        }
+    if EDIT_SCOPE in granted:
+        return None
+    return {
+        "error": "This tool requires GA4 edit permission, which has not been granted for this account.",
+        "required_scope": EDIT_SCOPE,
+        "account": account,
+        "granted_scopes": granted,
+        "remediation": (
+            "Re-authorize the account: call the add_account MCP tool and sign in with "
+            "the SAME Google account. When prompted by Google, grant the 'Edit Google "
+            "Analytics' permission. Selecting a different account during consent does "
+            "NOT merge scopes. If you prefer the terminal, run `ga4-mcp-add-account` — "
+            "in that case you must RESTART the MCP server afterwards so it picks up "
+            "the new credentials (the in-process credential cache is per-process)."
+        ),
+    }
 
 
 # --- Two-phase interactive OAuth flow with per-flow state ---
@@ -264,7 +450,9 @@ def start_oauth_flow() -> dict:
     port = server.server_address[1]
     redirect_uri = f"http://{host}:{port}"
 
-    # Build auth URL
+    # Build auth URL. include_granted_scopes=true lets re-auth upgrade read-only accounts
+    # to edit without losing previously granted scopes — provided the user signs in with
+    # the SAME Google account.
     auth_params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
@@ -272,6 +460,7 @@ def start_oauth_flow() -> dict:
         "scope": " ".join(SCOPES),
         "access_type": "offline",
         "prompt": "consent",
+        "include_granted_scopes": "true",
         "state": state,
     }
     auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(auth_params)}"
@@ -347,14 +536,20 @@ def complete_oauth_flow(timeout_seconds: int = 120) -> dict:
         if not email:
             return {"error": "Could not determine email address from login."}
 
+        # Google's token response includes a `scope` field (space-separated) listing the
+        # scopes actually granted. Fall back to the full requested SCOPES list only if
+        # that field is missing — in which case we assume the user granted everything.
+        granted_scopes = tokens.get("scope", "").split() or list(SCOPES)
+
         save_oauth_credentials(
             email=email,
             refresh_token=tokens["refresh_token"],
             client_id=flow["client_id"],
             client_secret=flow["client_secret"],
+            granted_scopes=granted_scopes,
         )
 
-        return {"email": email, "status": "success"}
+        return {"email": email, "status": "success", "granted_scopes": granted_scopes}
 
     except Exception as e:
         if "error" not in str(type(e).__name__).lower():

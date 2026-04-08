@@ -18,6 +18,8 @@ Connect Google Analytics 4 data to AI agents, agentic workflows, and MCP clients
 
 **Built for:** AI agents, analyst copilots, and MCP runtimes across Claude, ChatGPT, Cursor, Windsurf, and custom hosts.
 
+**v3.2 features:** GA4 Admin API write tools (mark key events, patch data streams, register custom dimensions), context-safe audit helpers (`ga4_get_landing_page_summary`, `ga4_compare_periods`, `ga4_health_check`), and a Screaming Frog CSV bridge. **Existing users must re-run `ga4-mcp-add-account` (or the `add_account` MCP tool) to grant the new `analytics.edit` scope before using any write tool** — read-only behavior is unchanged.
+
 **v3.1 features:** Zero-config OAuth login — just install and sign in with your Google account. Multi-property queries, multi-account support, and interactive account switching from any MCP client.
 
 </p>
@@ -292,14 +294,14 @@ get_ga4_data(
 
 ## Available Tools
 
-The server provides 12 tools for account management, property discovery, schema exploration, and data reporting. All data tools accept optional `property_id` and `account` parameters.
+All data tools accept optional `property_id` and `account` parameters. Tools marked *(write)* require an OAuth account with the `analytics.edit` scope — re-run `ga4-mcp-add-account` to upgrade.
 
 ### Account & Property Management
-1.  **`list_accounts`** - Show available service account and registered OAuth accounts
+1.  **`list_accounts`** - Show available service account and registered OAuth accounts, including `granted_scopes` and `can_edit`
 2.  **`add_account`** - Start interactive OAuth login (returns URL for user to click)
 3.  **`complete_account_login`** - Complete OAuth login after user authenticates in browser
 4.  **`remove_registered_account`** - Remove a registered OAuth account
-5.  **`list_properties`** - List all GA4 properties accessible by a given account
+5.  **`list_properties`** - List GA4 properties accessible by a given account (supports `name_contains` filter)
 
 ### Schema Discovery
 6.  **`search_schema`** - Search for dimensions and metrics by keyword (most efficient discovery method)
@@ -311,6 +313,24 @@ The server provides 12 tools for account management, property discovery, schema 
 
 ### Data Reporting
 12. **`get_ga4_data`** - Retrieve GA4 data with smart features (data volume protection, server-side aggregation, intelligent sorting)
+13. **`ga4_get_landing_page_summary`** *(v3.2)* - Context-safe landing-page audit with server-side totals and rot/engagement diagnostics
+14. **`ga4_compare_periods`** *(v3.2)* - Two-period delta comparison with outer-join on dimension tuples
+
+### Health & Diagnostics *(v3.2)*
+15. **`ga4_health_check`** - One-shot audit diagnostic (data streams, recent events, key-event presence, scope visibility)
+
+### GA4 Admin (write) *(v3.2)*
+16. **`ga4_list_key_events`** - List all key events (conversions) on a property
+17. **`ga4_create_key_event`** *(write)* - Mark an event as a key event (idempotent)
+18. **`ga4_delete_key_event`** *(write)* - Delete a key event by event_name (supports `dry_run`)
+19. **`ga4_list_data_streams`** - List data streams on a property
+20. **`ga4_update_data_stream`** *(write)* - Patch a data stream's display name or default URI (requires `confirm=True`)
+21. **`ga4_list_custom_dimensions`** - List custom dimensions on a property
+22. **`ga4_create_custom_dimension`** *(write)* - Register a custom dimension (idempotent; USER scope soft-blocked behind `allow_user_scope=True`)
+
+### Screaming Frog CSV Bridge *(v3.2)*
+23. **`ga4_load_sf_analytics_csvs`** - Load `analytics_*.csv` files from an SF export folder into an in-memory session
+24. **`ga4_query_sf_analytics`** - Query a loaded dataset with filter/sort/limit (no API quota burned)
 
 ---
 
@@ -385,12 +405,14 @@ google-analytics-mcp/
 ├── ga4_mcp/                # Main package directory
 │   ├── server.py           # Core server logic
 │   ├── coordinator.py      # MCP singleton instance
-│   ├── auth.py             # Multi-account credential management
+│   ├── auth.py             # Multi-account credential management + scope gating
 │   ├── default_client.py   # Embedded OAuth client credentials
 │   ├── add_account.py      # CLI for interactive OAuth registration
 │   └── tools/              # Tool definitions
-│       ├── metadata.py     # Schema discovery & account management tools
-│       └── reporting.py    # Data retrieval tool with smart features
+│       ├── metadata.py     # Schema discovery, account management, health check
+│       ├── reporting.py    # Data retrieval + landing page summary + compare periods
+│       ├── admin.py        # GA4 Admin API write tools (key events, data streams, custom dimensions)
+│       └── sf_bridge.py    # Screaming Frog analytics_*.csv loader + local query interface
 ├── scripts/                # Utility scripts
 ├── pyproject.toml          # Package configuration
 ├── README.md               # This file

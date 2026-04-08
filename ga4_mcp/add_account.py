@@ -61,11 +61,16 @@ def main():
 
     # Extract client_id and client_secret from the flow
     client_config = flow.client_config
+    # `creds.scopes` is the only scope-bearing attribute on google.oauth2.credentials.Credentials
+    # in google-auth 2.40.0. InstalledAppFlow populates it from the token-exchange response's
+    # `scope` field. Fall back to SCOPES if empty (very old responses).
+    granted_scopes = list(creds.scopes) if creds.scopes else list(SCOPES)
     save_oauth_credentials(
         email=email,
         refresh_token=creds.refresh_token,
         client_id=client_config["client_id"],
         client_secret=client_config["client_secret"],
+        granted_scopes=granted_scopes,
     )
 
     print(f"\nAccount registered: {email}")

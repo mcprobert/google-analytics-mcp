@@ -215,3 +215,443 @@ This document outlines a series of test cases to validate the accuracy, efficien
       }
       ```
 *   **Expected Result:** The query should succeed and return data showing the performance of your Google Ads campaigns and ad groups, validating that the advertising-related schema is handled correctly.
+
+---
+
+## Category 5: GA4 Admin API Write Tools (v3.2)
+
+**Objective:** Validate the new write tools added in v3.2. Integration tests use the Whitehat test property `443025343`.
+
+---
+
+### Test Case 5.1: Scope Remediation Error (Read-only account)
+
+*   **Goal:** Confirm `ensure_edit_scope` returns a clean remediation error for legacy/read-only accounts.
+*   **Precondition:** An OAuth account registered before v3.2 (no `granted_scopes` in its JSON file), OR an account that only granted `analytics.readonly`.
+*   **Query:** `ga4_list_key_events(property_id="443025343", account="<legacy_account>")`
+*   **Expected:** `{"error": "...", "required_scope": "https://www.googleapis.com/auth/analytics.edit", "remediation": "Re-authorize..."}`. No API call is made.
+
+---
+
+### Test Case 5.2: Scope Upgrade via Re-Authorization (in-process)
+
+*   **Goal:** Confirm that calling the `add_account` MCP tool to re-authorize an account upgrades it from read-only to edit **without restarting the server**, because `save_oauth_credentials` invalidates the in-process credentials cache.
+*   **Steps:**
+    1. From your MCP client, call `add_account()` → `complete_account_login()` and sign in with the SAME Google account as the legacy one. Grant the "Edit Google Analytics" permission when prompted.
+    2. Inspect `~/.config/ga4-mcp/accounts/<email>.json` — `granted_scopes` should include `https://www.googleapis.com/auth/analytics.edit`.
+    3. Call `list_accounts()` — the entry for this account should show `"can_edit": true`.
+    4. Immediately call `ga4_list_key_events(account="<email>")` — should now succeed, confirming the cache was invalidated and the next call picked up the new refresh token.
+*   **Expected:** Cache invalidation is transparent; no server restart required.
+*   **CLI variant:** If re-authorizing via `ga4-mcp-add-account` in a terminal instead, the MCP server must be restarted afterwards because the server and CLI run in different OS processes (each with its own in-memory credentials cache).
+
+---
+
+### Test Case 5.3: The Audit Repro (why this release exists)
+
+*   **Goal:** Reproduce the Whitehat scenario end-to-end: detect zero key events, fix it, verify the fix.
+*   **Steps:**
+    1. `ga4_get_landing_page_summary(property_id="443025343", date_range_start="90daysAgo")` — expect `diagnostics.zero_key_events_warning: true`.
+    2. `ga4_create_key_event(event_name="form_submit", property_id="443025343", account="<account_with_edit>")` — expect `{"status": "success", "action": "created"}`.
+    3. Re-run the same call immediately — expect `{"status": "success", "action": "existed"}` (idempotency).
+    4. Wait 24 hours for data to propagate, then re-run the summary.
+*   **Expected:** Post-fix summary shows `totals.key_events > 0` on the property.
+
+---
+
+### Test Case 5.4: Delete Dry-Run
+
+*   **Goal:** Confirm `dry_run=True` resolves the target without deleting.
+*   **Steps:**
+    1. Pick a stale key event on the test property (or create `test_delete_me` first).
+    2. `ga4_delete_key_event(event_name="test_delete_me", dry_run=True, ...)` — expect `{"status": "success", "action": "dry_run", "dry_run": true, "data": {...}}`.
+    3. Verify via `ga4_list_key_events` that it still exists.
+    4. Re-run without `dry_run` → actual delete.
+*   **Expected:** Dry-run returns the would-delete record without removing it; real delete removes it.
+
+---
+
+### Test Case 5.5: Data Stream Update Confirm Guard
+
+*   **Goal:** Verify that `ga4_update_data_stream` refuses to run without `confirm=True`.
+*   **Steps:**
+    1. `ga4_update_data_stream(stream_id="<id>", display_name="New Name")` — expect `{"error": "confirm=True is required...", "confirm_required": true}`.
+    2. Same call with `confirm=True` → expect success with `"action": "updated"` and `"updated_fields": ["display_name"]`.
+    3. `ga4_list_data_streams` → verify the new display name.
+
+---
+
+### Test Case 5.6: Custom Dimension USER-Scope Soft Block
+
+*   **Goal:** Verify the `USER` scope requires explicit confirmation.
+*   **Steps:**
+    1. `ga4_create_custom_dimension(parameter_name="hubspot_contact_id", display_name="HubSpot Contact ID")` — defaults to EVENT scope; expect success with `"action": "created"` (or `"existed"` on re-run).
+    2. `ga4_create_custom_dimension(parameter_name="plan_tier", display_name="Plan Tier", scope="USER")` — expect error explaining the cost implications.
+    3. Same call with `allow_user_scope=True` — expect success.
+
+---
+
+## Category 6: Aggregation & Audit Helpers (v3.2)
+
+---
+
+### Test Case 6.1: Landing Page Summary Context Safety
+
+*   **Goal:** Confirm the summary returns a context-safe response regardless of property size.
+*   **Query:** `ga4_get_landing_page_summary(property_id="443025343", date_range_start="90daysAgo", top_n=200)`
+*   **Expected:** Response has at most 200 rows; site-wide `totals` cover the full property (not just top 200); `warnings` and `diagnostics` populated. Response body ≤ ~10k tokens.
+
+---
+
+### Test Case 6.2: Compare Periods Long-Tail Join Warning
+
+*   **Goal:** Verify the `join_warning` flag fires for volatile long-tail dimensions.
+*   **Query:**
+    ```
+    ga4_compare_periods(
+        dimensions=["landingPagePlusQueryString"],
+        metrics=["sessions", "engagedSessions"],
+        period_a_start="56daysAgo", period_a_end="29daysAgo",
+        period_b_start="28daysAgo", period_b_end="yesterday",
+        sort_by_delta="sessions",
+        top_n=50,
+    )
+    ```
+*   **Expected:** Rows sorted by `abs(metrics.sessions.abs_delta)` descending. Any long-tail row with `a==0` or `b==0` triggers `join_warning: true`.
+
+---
+
+### Test Case 6.3: Health Check on Fresh Property
+
+*   **Goal:** Verify `ga4_health_check` surfaces the correct warnings and distinguishes between "no key events *configured*" (urgent) and "no recent key event *activity*" (informational, normal on low-traffic sites).
+*   **Query:** `ga4_health_check(property_id="443025343", account="<your_account>")`
+*   **Expected response shape:**
+    ```json
+    {
+      "status": "success",
+      "has_data": true,
+      "has_key_events_configured": false,          // from Admin API list_key_events
+      "key_events_configured_count": 0,
+      "has_key_event_activity_30d": false,         // from Data API keyEvents metric
+      "data_stream_count": 1,
+      "last_event_received": "YYYYMMDD",
+      "can_edit": true,                            // matches account grants
+      "probes": {
+        "data_streams_ok": true,
+        "key_events_ok": true,
+        "data_api_ok": true
+      },
+      "warnings": [
+        "zero_key_events_configured: this property has no key events configured..."
+      ]
+    }
+    ```
+*   **Expected warnings:** For the unfixed Whitehat test property, exactly `zero_key_events_configured` should appear (not `zero_key_event_activity_30d` — that's only emitted when key events *are* configured but none fired). After creating `form_submit` in Test Case 5.3 and waiting 24h, re-run — expect `has_key_events_configured: true` and `has_key_event_activity_30d: true`.
+*   **Probe-success gating test (permission-denied):** Temporarily use an account that lacks Admin API read access and call `ga4_health_check`. Expected: `probes.data_streams_ok: false` AND `probes.key_events_ok: false`, `warnings` contains exactly ONE `admin_list_permission_denied: ...` entry (the key-events probe is short-circuited because the same permission gates both list calls), and NO `no_data_stream_found`, `zero_key_events_configured`, `list_key_events_failed`, or `list_data_streams_failed` entries — because neither probe succeeded, we cannot claim anything about configuration.
+*   **Probe-success gating test (partial pager failure):** Mock the Admin API `list_data_streams` pager to yield one stream then raise a non-PermissionDenied exception. Expected: `probes.data_streams_ok: false`, `data_streams: []`, `data_stream_count: 0`, warning label `list_data_streams_failed_after_1_streams: ...` preserving the partial-progress count for diagnostics.
+
+---
+
+### Test Case 6.4: Traffic-Without-Key-Events Finding (the Whitehat audit repro)
+
+*   **Goal:** Verify `ga4_health_check` surfaces the `traffic_without_key_events` warning that v3.2.0 was built to enable.
+*   **Precondition:** A property with `has_data: true` (events recorded in last 30 days) and `has_key_events_configured: false` (no key events registered in Admin). The pre-fix Whitehat test property `443025343` matches this exactly.
+*   **Query:** `ga4_health_check(property_id="443025343", account="<edit_capable_account>")`
+*   **Expected warnings array** contains BOTH:
+    *   `zero_key_events_configured: this property has no key events configured...`
+    *   `traffic_without_key_events: the property is receiving events but has no key events configured. Conversions will not be attributed...`
+*   **Why both fire:** they're related but distinct findings. `zero_key_events_configured` is the static config state; `traffic_without_key_events` is the dynamic "and you're losing data right now" framing. Both should be visible to the caller.
+*   **Post-remediation check:** After `ga4_create_key_event(event_name="form_submit", ...)` in Test Case 5.3, re-running the health check should drop BOTH warnings — `has_key_events_configured: true` and the audit finding warning clears.
+
+---
+
+### Test Case 6.5: Account Validation Early-Exit
+
+*   **Goal:** Verify `ga4_health_check` returns a clean error dict (not a success dict with cascading probe failures) for unknown or malformed account identifiers.
+*   **Queries and expected responses:**
+    *   `ga4_health_check(account="bogus@example.test")` → `{"error": "No stored credentials for 'bogus@example.test'...", "property_id": ..., "account": "bogus@example.test"}` with NO `warnings`, `probes`, or `status: success`.
+    *   `ga4_health_check(account="../etc/passwd")` → `{"error": "Invalid account identifier '../etc/passwd': ...", ...}` — path-traversal rejected by `_safe_account_path`.
+    *   `ga4_health_check(account=None)` → runs normally using default credentials; no early bail-out.
+*   **Corrupt JSON file:** if an account's token file exists but contains invalid JSON, the early check passes (file exists), then the probe blocks surface the corruption as `credentials_failed:` / `data_api_probe_failed:` warnings — NOT misclassified as "account not found". This is the critical distinction from a naive `except ValueError: return error` approach (JSONDecodeError inherits from ValueError).
+
+---
+
+### Test Case 6.4: `list_properties(name_contains=...)` Filter
+
+*   **Goal:** Verify the filter is applied case-insensitively in Python.
+*   **Query:** `list_properties(account="<multi_property_account>", name_contains="whitehat")`
+*   **Expected:** Only properties whose display name contains "whitehat" (case-insensitive).
+
+---
+
+## Category 7: Screaming Frog CSV Bridge (v3.2)
+
+---
+
+### Test Case 7.1: Partial Load Semantics
+
+*   **Goal:** Verify that broken files are reported but do not abort the load.
+*   **Setup:** Create a folder with `analytics_all.csv` (valid), `analytics_orphan.csv` (valid), and `analytics_broken.csv` (intentionally malformed — truncated quote or invalid UTF-8).
+*   **Query:** `ga4_load_sf_analytics_csvs(sf_export_path="<folder>")`
+*   **Expected:** `{"status": "success", "session_id": "sf-...", "datasets": {"all": n, "orphan": n}, "loaded_partial": [{"file": "analytics_broken.csv", "reason": "..."}]}`.
+
+---
+
+### Test Case 7.2: Query Filter Operators
+
+*   **Goal:** Exercise each supported filter operator.
+*   **Queries:**
+    1. `ga4_query_sf_analytics(session_id, dataset="all", filter={"address": {"contains": "/blog"}})`
+    2. `ga4_query_sf_analytics(session_id, dataset="all", filter={"sessions": {"gt": 100}})`
+    3. `ga4_query_sf_analytics(session_id, dataset="all", sort_by="sessions", sort_desc=True, limit=10)`
+*   **Expected:** Each returns filtered/sorted rows with `total_matched`, `returned`, and `limit`.
+
+---
+
+### Test Case 7.3: Invalid Operator
+
+*   **Goal:** Verify unsupported filter operators are rejected up front.
+*   **Query:** `ga4_query_sf_analytics(session_id, dataset="all", filter={"sessions": {"between": [100, 200]}})`
+*   **Expected:** `{"error": "Unsupported filter operator 'between'..."}`. No row scan performed.
+
+---
+
+### Test Case 7.4: Header-only CSV preserved as empty queryable dataset
+
+*   **Goal:** Verify that a legitimately empty CSV (header row only, zero data rows — e.g. `analytics_orphan_urls.csv` on a site with no orphan pages) is stored as an empty queryable dataset, NOT dropped from the session.
+*   **Setup:** Create a folder with `analytics_orphan_urls.csv` containing only a header line (e.g., `address,title\n`) and one other file with real data.
+*   **Steps:**
+    1. `ga4_load_sf_analytics_csvs(sf_export_path="<folder>")` → `status: success`, `datasets` contains BOTH files (the empty one shows `row_counts["orphan_urls"] == 0`).
+    2. `ga4_query_sf_analytics(session_id, dataset="orphan_urls", limit=100)` → `{"status": "success", "rows": [], "total_matched": 0, "returned": 0}` — NOT "dataset not found".
+*   **All-empty edge case:** If every file in the folder is header-only, the load still returns `status: success` with empty datasets, NOT the "Failed to load any analytics_*.csv files" error.
+
+---
+
+### Test Case 7.5: sort_desc honored for text columns
+
+*   **Goal:** Verify that `sort_desc=True` produces descending order for both numeric AND text columns (previously silently ignored for text).
+*   **Setup:** A CSV with columns `address` (text) and `sessions` (numeric), populated with 5+ rows of mixed data.
+*   **Queries:**
+    1. `ga4_query_sf_analytics(session_id, dataset="all", sort_by="address", sort_desc=True)` → rows in alphabetical Z→A order
+    2. `ga4_query_sf_analytics(session_id, dataset="all", sort_by="address", sort_desc=False)` → rows in alphabetical A→Z order
+    3. `ga4_query_sf_analytics(session_id, dataset="all", sort_by="sessions", sort_desc=True)` → rows in numeric high→low order, blanks/non-numeric at the end
+*   **Expected:** `sort_desc` applies uniformly; non-numeric values (blank, NaN, unparseable) always group at the end regardless of direction.
+
+---
+
+## Category 8: Round 3 Fixes (Admin credential error handling)
+
+### Test Case 8.1: Corrupt token file with write tool
+
+*   **Goal:** Verify that a write tool on an account with a corrupted token file surfaces a "corrupt file" error at the `ensure_edit_scope` level, NOT the misleading "legacy registration" error that `get_granted_scopes` would produce by swallowing `JSONDecodeError`.
+*   **Setup:**
+    1. Register a valid OAuth account via `add_account`.
+    2. Manually corrupt the JSON file: overwrite `~/.config/ga4-mcp/accounts/<email>.json` with invalid JSON (e.g., `{"email": "broken`).
+*   **Query:** `ga4_create_key_event(event_name="form_submit", account="<corrupted_email>")`
+*   **Expected:** `{"error": "Credential file for '<email>' is corrupt or unreadable: ...", "exception_type": "JSONDecodeError", ...}`. NOT `"Account '<email>' has no recorded scope grants (legacy registration or unknown account)..."`.
+*   **Recovery:** Re-run `ga4-mcp-add-account` (or the `add_account` MCP tool) to overwrite the corrupt file with a valid re-authorized token.
+
+---
+
+### Test Case 8.2: Revoked refresh token with Admin tool
+
+*   **Goal:** Verify that a `RefreshError` from google-auth (e.g., refresh token revoked in the user's Google account security settings) is caught by `_admin_client` and returned as a normalized error dict — NOT propagated as an uncaught tool failure.
+*   **Setup:**
+    1. Register a valid OAuth account.
+    2. In Google Account → Security → Third-party apps with account access, revoke the GA4 MCP app's access.
+*   **Query:** `ga4_list_key_events(account="<revoked_email>")` (or any other admin tool)
+*   **Expected:** `{"error": "Refresh token for '<email>' was rejected by Google: ...", "exception_type": "RefreshError", ...}`. No uncaught exception.
+
+---
+
+### Test Case 8.3: Unknown account with Admin tool
+
+*   **Goal:** Verify the account-exists pre-check catches typo'd account names before any network call.
+*   **Query:** `ga4_list_key_events(account="typo@example.test")`
+*   **Expected:** `{"error": "No stored credentials for 'typo@example.test'. Use the add_account MCP tool or run `ga4-mcp-add-account` to register this account.", ...}`. No HTTP requests made.
+
+---
+
+### Test Case 8.4: Path-traversal account identifier
+
+*   **Goal:** Verify `_safe_account_path` rejects path-traversal attempts with a clear error.
+*   **Query:** `ga4_list_key_events(account="../../etc/passwd")`
+*   **Expected:** `{"error": "Invalid account identifier '../../etc/passwd': ...", ...}`.
+
+---
+
+## Category 9: Round 4 Fixes (Aggregation tools — nullable semantics)
+
+### Test Case 9.1: Landing page summary — `(not set)` already in top_n (no extra API call)
+
+*   **Goal:** When `(not set)` appears in the main response's top_n rows, `ga4_get_landing_page_summary` should compute `high_not_set_pct` from the existing data WITHOUT issuing a targeted probe.
+*   **Steps:**
+    1. Mock the main `run_report` to return top_n rows including one for `landingPagePlusQueryString == "(not set)"` with e.g. 1500 sessions, plus a totals row with e.g. 10000 sessions.
+    2. Mock the `(not set)` targeted probe to raise `AssertionError` (to catch unwanted invocation).
+    3. Call `ga4_get_landing_page_summary(...)`.
+*   **Expected:**
+    *   `totals.high_not_set_pct == 0.15`
+    *   `totals.high_not_set_pct_source == "top_rows"`
+    *   `probes.not_set_probe_ok == True`
+    *   `diagnostics.high_not_set_pct_warning == True` (> 5%)
+    *   Targeted probe was NOT called.
+
+### Test Case 9.2: Landing page summary — `(not set)` outside top_n (targeted probe)
+
+*   **Goal:** When `(not set)` is absent from the top_n rows, the function should issue the targeted filtered query.
+*   **Setup:** Main response returns top_n rows without any `(not set)` entry, totals row has 10000 sessions. Targeted probe returns 1 row with 2000 sessions.
+*   **Expected:**
+    *   `totals.high_not_set_pct == 0.2`
+    *   `totals.high_not_set_pct_source == "filtered_probe"`
+    *   `probes.not_set_probe_ok == True`
+    *   Targeted probe WAS called exactly once.
+
+### Test Case 9.3: Landing page summary — not-set probe fails gracefully
+
+*   **Goal:** When the targeted probe raises, `high_not_set_pct` must be `None` (not 0.0), the warning must NOT fire, and `probes.not_set_probe_ok` must be `False`.
+*   **Setup:** Main response has no `(not set)` rows; targeted probe raises an exception.
+*   **Expected:**
+    *   `totals.high_not_set_pct is None`
+    *   `totals.high_not_set_pct_source == "unavailable"`
+    *   `probes.not_set_probe_ok == False`
+    *   `diagnostics.high_not_set_pct_warning == False`
+    *   `warnings` contains `not_set_probe_failed: ...`
+
+### Test Case 9.4: Landing page summary — empty property does not false-fire warnings
+
+*   **Goal:** On an empty property (zero sessions in the date range), neither `low_engagement_warning` nor `zero_key_events_warning` should fire. Previously both would fire because `engagement_rate` defaulted to 0.0 and `keyEvents` defaulted to 0.
+*   **Setup:** Mock the main call to return zero rows and a totals row with all metrics = 0 (or None).
+*   **Expected:**
+    *   `totals.engagement_rate is None` (not 0.0)
+    *   `diagnostics.zero_key_events_warning == False`
+    *   `diagnostics.low_engagement_warning == False`
+    *   `diagnostics.high_not_set_pct_warning == False`
+    *   No misleading remediation warnings in the response.
+
+### Test Case 9.5: Compare periods — totals_delta via server-side TOTAL
+
+*   **Goal:** Verify `totals_delta["engagementRate"]` uses the GA4 report-wide totals row, NOT a Python sum of per-row rates.
+*   **Setup:** Mock period A to return a totals row with `engagementRate=0.5`, `sessions=1000`. Mock period B to return a totals row with `engagementRate=0.6`, `sessions=1200`. The per-row values can be anything.
+*   **Expected:**
+    *   `totals_delta["engagementRate"] == {"a": 0.5, "b": 0.6, "abs_delta": ~0.1, "pct_delta": 0.2}`
+    *   `totals_delta["sessions"] == {"a": 1000, "b": 1200, "abs_delta": 200, "pct_delta": 0.2}`
+    *   `metadata.totals_scope == "full_filtered_report"`
+    *   `probes.period_a_totals_available == True`
+    *   `probes.period_b_totals_available == True`
+
+### Test Case 9.6: Compare periods — one period totals unavailable
+
+*   **Goal:** When GA4 returns no totals row for one period (e.g. empty data), per-metric deltas are `None` for the affected metrics and `probes.period_*_totals_available` reflects which one.
+*   **Setup:** Period A returns a normal totals row. Period B returns `response.totals = []` (no totals row).
+*   **Expected:**
+    *   `totals_delta["sessions"] == {"a": <number>, "b": None, "abs_delta": None, "pct_delta": None}`
+    *   `probes.period_b_totals_available == False`
+
+### Test Case 9.7: Health check — all probes succeed (status=success)
+
+*   **Goal:** When all three probes (data streams, key events, Data API) succeed, the status is `"success"` and all fields have definitive values.
+*   **Expected:**
+    *   `status == "success"`
+    *   `has_data`, `has_key_events_configured`, `has_key_event_activity_30d` are definitive booleans (not None)
+    *   `key_events_configured_count` and `data_stream_count` are definitive integers (not None)
+    *   `probes` sub-dict has all three flags as `True`.
+
+### Test Case 9.8: Health check — partial probe failure (status=partial_success)
+
+*   **Goal:** When one probe fails but others succeed, status is `"partial_success"` and the fields from the failed probe are `None` (not `False` / `0`).
+*   **Setup:** Mock `list_data_streams` to raise, Data API and `list_key_events` succeed.
+*   **Expected:**
+    *   `status == "partial_success"`
+    *   `data_stream_count is None` (was `0` before Round 4 — the fix)
+    *   `data_streams == []`
+    *   `has_data`, `has_key_events_configured` are definitive (their probes succeeded)
+    *   `probes.data_streams_ok == False`, `probes.key_events_ok == True`, `probes.data_api_ok == True`
+
+### Test Case 9.9: Health check — all probes fail (error dict)
+
+*   **Goal:** When no probe succeeds (e.g. no credentials, no access to property), the response is an error dict with `probes` and `warnings` included — NOT a success dict with all-False fields.
+*   **Setup:** Mock `resolve_credentials` to raise, which cascades into all three probes failing.
+*   **Expected:**
+    *   Response has `error` key with a message about "all probes failed"
+    *   Response has `probes` sub-dict showing all three as `False`
+    *   Response has `warnings` list with the specific failure modes
+    *   NO `status: "success"` claim
+    *   NO `has_data: False` etc. (those are nullable and absent from error dicts)
+
+---
+
+## Category 10: Round 5 Fixes (Nullable Semantics Sweep)
+
+### Test Case 10.1: `totals.form_events` is None on query failure
+
+*   **Goal:** When the form events query raises an exception, `totals.form_events` must be `None` (not `{form_submit: 0, form_start: 0}`), and `probes.form_events_probe_ok` must be `False`.
+*   **Setup:** Mock the main `run_report` to return normal landing-page data with totals. Mock the second `run_report` call (form events query) to raise an exception.
+*   **Expected:**
+    *   `totals.form_events is None` (was `{form_submit: 0, form_start: 0}` before Round 5 — the bug)
+    *   `probes.form_events_probe_ok is False`
+    *   `warnings` list contains `form_events_query_failed: ...`
+    *   Rest of the response shape unchanged (top landing pages, totals, etc.)
+
+### Test Case 10.2: `totals.form_events` partial success (some events fired, others didn't)
+
+*   **Goal:** When the form events query succeeds and one event fired but the other didn't, the response contains measured counts for the firing event AND a measured-zero for the non-firing event. GA4 omits all-zero rows from the response by default, so this exercises the "fill missing events with 0" branch.
+*   **Setup:** Mock the form events query to return one row: `eventName=form_submit, eventCount=42`. The `form_start` event is NOT in the response (it didn't fire).
+*   **Expected:**
+    *   `totals.form_events == {"form_submit": 42, "form_start": 0}`
+    *   `probes.form_events_probe_ok is True`
+    *   No `form_events_query_failed` warning
+
+### Test Case 10.3: `totals.form_events` all-zero on successful query with empty period
+
+*   **Goal:** When the form events query succeeds but returns zero rows (empty period or no events fired at all), the response reports every form event as measured-zero, not None.
+*   **Setup:** Mock the form events query to return an empty rows list.
+*   **Expected:**
+    *   `totals.form_events == {"form_submit": 0, "form_start": 0}`
+    *   `probes.form_events_probe_ok is True` (the probe succeeded, the property just has no form events)
+    *   No warnings related to form events
+
+### Test Case 10.4: `median_sessions` / `median_engagement_rate` are None on empty `shaped_rows`
+
+*   **Goal:** When the main landing-page query returns zero rows (empty property / empty date range), both median fields must be `None`, not `0`.
+*   **Setup:** Mock the main query to return an empty rows list. Totals row may or may not be present (test both).
+*   **Expected:**
+    *   `totals.median_sessions is None`
+    *   `totals.median_engagement_rate is None`
+    *   `rot_flag` does not appear in any row (there are no rows)
+
+### Test Case 10.5: `median_sessions` is float for even-sized `shaped_rows` (per open-gem)
+
+*   **Goal:** Verify that `median_sessions` can be a float, not just an int. `statistics.median([100, 200])` returns `150.0` (float) because of the two-element even-size average.
+*   **Setup:** Mock the main query to return exactly 2 rows with `sessions` values 100 and 200.
+*   **Expected:**
+    *   `totals.median_sessions == 150.0`
+    *   `isinstance(totals.median_sessions, float) is True`
+    *   Any caller/display code that assumed `int` will need to handle `float` too (this is a pre-existing semantic, just now uncovered by the test).
+
+### Test Case 10.6: `ga4_health_check.data_streams` is None on probe failure
+
+*   **Goal:** When `list_data_streams` raises, BOTH `data_stream_count` AND `data_streams` must be `None` — not `None` and `[]` which was the Round 4 → Round 5 inconsistency.
+*   **Setup:** Mock `list_data_streams` to raise `RuntimeError`. Mock `list_key_events` and the Data API probe to succeed so the overall status is `partial_success`.
+*   **Expected:**
+    *   `status == "partial_success"`
+    *   `data_stream_count is None`
+    *   `data_streams is None` (was `[]` before Round 5 — the bug)
+    *   `probes.data_streams_ok is False`
+
+### Test Case 10.7: `ga4_health_check.data_streams` is `[]` for real measured-zero
+
+*   **Goal:** Regression — when the probe succeeds and the property genuinely has zero data streams, `data_streams` is an empty list `[]` (real measured-zero), NOT `None`.
+*   **Setup:** Mock `list_data_streams` to return an empty iterator cleanly (no exception, zero items).
+*   **Expected:**
+    *   `status == "success"` (all probes OK, assuming the other probes pass)
+    *   `data_stream_count == 0`
+    *   `data_streams == []` (NOT `None` — the probe measured this)
+    *   `probes.data_streams_ok is True`
+
+### Test Case 10.8: Round 4 regression — no field names changed
+
+*   **Goal:** Verify that Round 5 did NOT rename any existing `probes` sub-dict keys (the N2 rename was dropped after open-gem critique).
+*   **Checks (via grep or inspection of live responses):**
+    *   `ga4_get_landing_page_summary.probes` still uses `totals_available`, `not_set_probe_ok` (plus the new `form_events_probe_ok` from M1)
+    *   `ga4_compare_periods.probes` still uses `period_a_totals_available`, `period_b_totals_available`
+    *   `ga4_health_check.probes` still uses `data_streams_ok`, `key_events_ok`, `data_api_ok`
+    *   Round 4 behavioral tests pass unchanged (no test rewrites required)

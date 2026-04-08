@@ -15,7 +15,9 @@
 import os
 import sys
 from .coordinator import mcp
-from .tools import metadata, reporting
+# Importing these modules triggers their @mcp.tool() decorators, which is the only
+# thing that registers the tools with the singleton. Do not remove unused-import suppressions.
+from .tools import metadata, reporting, admin, sf_bridge  # noqa: F401
 from .auth import list_registered_accounts
 
 def main():

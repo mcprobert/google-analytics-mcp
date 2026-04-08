@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-04-08
+
+### Added
+- **GA4 Admin API write tools** (new `ga4_mcp/tools/admin.py`). Audits can now fix measurement-layer issues in-band instead of requiring a human to click through the GA4 UI:
+  - `ga4_list_key_events`, `ga4_create_key_event` (idempotent, paginated scan), `ga4_delete_key_event` (supports `dry_run=True`)
+  - `ga4_list_data_streams`, `ga4_update_data_stream` (requires `confirm=True`; updates `display_name` and `web_stream_data.default_uri`)
+  - `ga4_list_custom_dimensions`, `ga4_create_custom_dimension` (idempotent; `USER` scope soft-blocked behind `allow_user_scope=True`)
+- **`ga4_get_landing_page_summary`** — context-safe audit summary with server-side totals, rot/engagement diagnostics, zero-key-events warning, and configurable `form_event_names` (defaults to `["form_submit","form_start"]`).
+- **`ga4_compare_periods`** — two-period delta comparison with outer-join on dimension tuples and `join_warning` flag for long-tail truncation.
+- **Screaming Frog CSV bridge** (new `ga4_mcp/tools/sf_bridge.py`): `ga4_load_sf_analytics_csvs` + `ga4_query_sf_analytics`. Thread-safe in-memory session store, stdlib-only, no network I/O.
+- **`ga4_health_check`** — one-shot audit diagnostic. Returns `has_key_events_configured` (from Admin API `list_key_events` — the *is it set up?* question), `has_key_event_activity_30d` (from Data API — the *is anything firing?* question), `key_events_configured_count`, `data_stream_count`, `last_event_received`, `can_edit`, and a `probes` dict indicating which API probes succeeded. Warnings are only emitted when the corresponding probe completed cleanly (no false `no_data_stream_found` after a permission error; no false `zero_key_events_configured` remediation on low-traffic properties).
+- **`list_properties(name_contains=...)`** — case-insensitive substring filter for accounts with many properties.
+- **`list_accounts`** now reports `granted_scopes` and `can_edit` per account.
+- New `analytics.edit` OAuth scope requested for new registrations; `include_granted_scopes=true` set on the auth URL so re-auth upgrades read-only accounts without losing previously granted scopes (requires signing in with the same Google account).
+- New `ensure_edit_scope(account)` helper in `auth.py`. Every write tool gates on it and returns a clean remediation message if the account lacks `analytics.edit`. Legacy account JSON files (schema v1, no `granted_scopes` field) fail closed — `ensure_edit_scope` treats them as read-only and directs the user to re-authorize. Corrupt token files are surfaced as a dedicated "credential file is corrupt" error rather than the generic "legacy registration" message.
+- **Nullable-semantics response shape** for the aggregation and diagnostic tools. Fields that cannot be measured return `None` rather than a misleading `0` / `False` / `[]`:
+  - `ga4_get_landing_page_summary` — `totals.sessions`, `totals.engaged_sessions`, `totals.engagement_rate`, `totals.key_events`, `totals.total_users`, `totals.form_events`, `totals.high_not_set_pct`, and the median fields are `None` when the underlying GA4 totals row or sub-probe was unavailable. A `totals.high_not_set_pct_source` field and a top-level `probes` sub-dict (`totals_available`, `not_set_probe_ok`, `form_events_probe_ok`) tell the caller which measurements succeeded.
+  - `ga4_compare_periods` — `totals_delta` now comes from GA4's server-side `MetricAggregation.TOTAL` rather than a Python sum across top-N rows, which makes the totals valid for ratio and duration metrics (`engagementRate`, `averageSessionDuration`, `bounceRate`, etc.). Per-metric deltas are `None` when a period's totals row is unavailable; new `probes.period_a_totals_available` / `probes.period_b_totals_available` flags distinguish. Metadata includes `totals_scope: "full_filtered_report"` so callers do not expect `sum(rows[m]) == totals_delta[m]`.
+  - `ga4_health_check` — tri-state `status` field: `"success"` when all probes succeed, `"partial_success"` when some fail, or an error dict (no `status: success` claim) when all probes fail. Probe-dependent fields (`has_data`, `has_key_events_configured`, `key_events_configured_count`, `has_key_event_activity_30d`, `data_stream_count`, `data_streams`) are `None` when the underlying probe failed — distinguishing "we could not measure this" from "we measured and it is zero". `can_edit` remains a definitive boolean because it is read from stored OAuth scopes. The `last_event_received: None` ambiguity (probe failed vs. no events recorded) is now documented in the tool docstring.
+- **Audit diagnostics** — new warnings that fire on real GA4 audit findings: `traffic_without_key_events` (the Whitehat finding that prompted the release), `stale_key_event_activity` (key events deleted but historical counts still in the 30-day window), `data_streams_configured_but_silent`, `zero_key_event_activity_30d`. Empty-property warnings (`low_engagement_warning`, `zero_key_events_warning`) no longer false-fire when a property has zero sessions in the selected date range.
+- **Screaming Frog CSV bridge correctness** — header-only CSVs (e.g. `analytics_orphan_urls.csv` on a clean site) are preserved as empty queryable datasets instead of being dropped. `sort_desc` is honored uniformly for numeric AND text columns via a two-phase partition sort (non-numeric rows always group at the end regardless of direction). `_coerce_number` filters NaN values that would otherwise pollute the numeric sort group with non-deterministic order. Mid-file session-cap truncation is reported in `loaded_partial` for the current file, not just later files.
+- **Admin API error normalization** — all seven Admin write tools now route credential-resolution failures through a new `AdminClientError` exception that produces distinct actionable error messages for each failure mode (unknown account, corrupt token file, revoked refresh token, transport error, missing default credentials). Programming errors (KeyError, AttributeError) still propagate uncaught so they surface in tests.
+
+### Changed
+- `save_oauth_credentials` accepts and persists a `granted_scopes` list (schema version 2). Missing field = legacy account, treated as read-only by `ensure_edit_scope`. Also invalidates the in-process credentials cache entry for the email so re-auth inside the same server process takes effect on the very next call. Credential files are written atomically via temp-file + `os.replace`, so readers never observe a partially-written file on concurrent save.
+- `complete_oauth_flow` captures scopes from the token-exchange response's `scope` field (authoritative).
+- `get_oauth_credentials` passes the persisted `granted_scopes` (or `None` for legacy accounts) to the `Credentials` constructor, rather than the full `SCOPES` superset. This fixes a critical regression where legacy v3.1.0 read-only refresh tokens would have been rejected by Google as `invalid_scope` on every refresh under v3.2.0.
+- `ga4-mcp-add-account` CLI captures `creds.scopes` and writes them to the account file (best-effort; in practice mirrors the token-exchange `scope` field).
+
+### Migration notes
+- Existing users must re-run `ga4-mcp-add-account` (or call the `add_account` MCP tool) to grant `analytics.edit` before using any write tool. Read-only behavior is unchanged — existing accounts continue to work with the existing read-only tools without any action.
+- When re-authorizing via the terminal CLI (`ga4-mcp-add-account`) while the MCP server is running in a separate process, you must restart the MCP server for the new credentials to take effect. When re-authorizing via the `add_account` MCP tool (in-process), no restart is required — the credentials cache is invalidated automatically.
+
 ## [3.1.0] - 2026-03-26
 
 ### Added
