@@ -179,6 +179,12 @@ Show me traffic for property 123456789 using account alice@company.com
 
 Use `list_accounts` to see all registered accounts and `list_properties` to discover which GA4 properties each account can access.
 
+### `(account, property_id)` is a pair *(v3.3)*
+
+GA4 access is credential-scoped: a property discovered via `list_properties(account="alice@company.com")` requires `account="alice@company.com"` on every later call too. `list_properties()` with no `account` argument returns properties for default credentials only — it is NOT a global list across registered OAuth accounts; check `other_accounts_available` in the response to enumerate.
+
+Every tool response now includes a `property_used` block (`{id, was_explicit, account, account_parameter, account_was_explicit}`) and, when the configured default property was used silently, a `notice` field pointing the agent at `list_properties()`. Pass the `account_parameter` value back as the `account` argument on follow-up calls — never the literal string `"default credentials"`.
+
 ---
 
 ## Usage

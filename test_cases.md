@@ -655,3 +655,155 @@ This document outlines a series of test cases to validate the accuracy, efficien
     *   `ga4_compare_periods.probes` still uses `period_a_totals_available`, `period_b_totals_available`
     *   `ga4_health_check.probes` still uses `data_streams_ok`, `key_events_ok`, `data_api_ok`
     *   Round 4 behavioral tests pass unchanged (no test rewrites required)
+
+---
+
+## Category 11: Multi-Account & Multi-Property Discoverability (v3.3.0)
+
+These scenarios verify the agent-facing fix for the "default property trap" — agents seeing a configured default and falsely concluding they have no access to other properties or other registered accounts. The selector is `(account, property_id)` as a pair.
+
+### Test Case 11.1: `get_ga4_data` defaulted property — `property_used` + `notice` emitted
+
+*   **Goal:** When `GA4_PROPERTY_ID` is set and the agent calls `get_ga4_data` with no `property_id`, the response surfaces which property was actually used and includes a `notice` pointing the agent at `list_properties()`.
+*   **Setup:** Set `GA4_PROPERTY_ID=<some-numeric-id>`, do not pass `property_id` to the tool.
+*   **Expected:**
+    *   `response.property_used.id == <some-numeric-id>`
+    *   `response.property_used.was_explicit is False`
+    *   `response.property_used.account == "default credentials"`
+    *   `response.property_used.account_parameter is None`
+    *   `response.notice` exists and mentions `list_properties()` and `account=`
+
+### Test Case 11.2: `get_ga4_data` explicit property — `was_explicit: True`, no notice
+
+*   **Goal:** Passing `property_id` explicitly suppresses the notice.
+*   **Setup:** With `GA4_PROPERTY_ID` set to property A, call `get_ga4_data(property_id="<property-B>")`.
+*   **Expected:**
+    *   `response.property_used.id == "<property-B>"`
+    *   `response.property_used.was_explicit is True`
+    *   `"notice" not in response`
+
+### Test Case 11.3: No default + no explicit — actionable error
+
+*   **Goal:** When `GA4_PROPERTY_ID` is unset and the agent calls a tool with no `property_id`, the error message names `list_accounts()`, `list_properties(account="...")`, and the credential pairing rule.
+*   **Setup:** Unset `GA4_PROPERTY_ID`, call any tool with `property_id=None`.
+*   **Expected:**
+    *   `response.error` mentions `list_accounts()`, `list_properties()`, and `account="..."`.
+    *   `response.error` does not just say the generic "No property_id provided".
+
+### Test Case 11.4: `list_accounts()` shape — `usage` + per-entry `account_parameter`
+
+*   **Goal:** Agents reading `list_accounts()` see how to use what they got.
+*   **Setup:** Have at least one OAuth account registered AND default credentials available. Call `list_accounts()`.
+*   **Expected:**
+    *   `response.usage` is a non-empty string mentioning `list_properties(account=...)` and the credential-scoping rule.
+    *   The default-credentials entry has `email == "default credentials"` AND `account_parameter is None`.
+    *   Each OAuth entry has `account_parameter == <email>` (string, never null).
+
+### Test Case 11.5: `list_properties()` (no account) — `usage` says "not global", `other_accounts_available` populated
+
+*   **Goal:** Agents reading `list_properties()` with no `account` argument see that the result is scoped to default credentials only AND learn other accounts exist.
+*   **Setup:** Default credentials configured + 2 OAuth accounts registered. Call `list_properties()` with no `account`.
+*   **Expected:**
+    *   `response.usage` includes the phrase "not include properties accessible only through registered OAuth accounts" (or equivalent — the literal string "not global" or "default credentials only" suffices).
+    *   `response.other_accounts_available` is a list with both registered OAuth emails.
+    *   `response.account_parameter is None`.
+    *   `response.using_account == "default credentials"` (preserved from v3.2.0).
+
+### Test Case 11.6: `list_properties(account="alice@example.com")` — `usage` mentions both `property_id` and the same account
+
+*   **Goal:** Agents reading per-account `list_properties` learn the pairing rule for next-call scoping.
+*   **Setup:** Register `alice@example.com`, call `list_properties(account="alice@example.com")`.
+*   **Expected:**
+    *   `response.usage` mentions both `property_id` AND `account="alice@example.com"`.
+    *   `response.account_parameter == "alice@example.com"`.
+    *   `response.using_account == "alice@example.com"`.
+    *   `response.other_accounts_available` does NOT contain `alice@example.com` (it should list the other OAuth accounts).
+
+### Test Case 11.7: Per-account property query end-to-end
+
+*   **Goal:** A property discovered under one account remains queryable when the same account is passed back.
+*   **Setup:** Find a property `P` under account `alice@example.com` via `list_properties(account="alice@example.com")`. Then call `get_ga4_data(property_id=P, account="alice@example.com")`.
+*   **Expected:**
+    *   Successful data response.
+    *   `response.property_used.account == "alice@example.com"`.
+    *   `response.property_used.account_parameter == "alice@example.com"`.
+    *   `response.property_used.account_was_explicit is True`.
+
+### Test Case 11.8: Per-account property without account fails (or returns unrelated default-credentials data)
+
+*   **Goal:** Demonstrate that omitting `account` for an OAuth-only property does NOT silently succeed — exercising the trap the fix addresses.
+*   **Setup:** Take property `P` accessible only via `alice@example.com`. Call `get_ga4_data(property_id=P)` with no `account`.
+*   **Expected (non-deterministic, but one of):**
+    *   GA4 API permission error from the underlying client (because default credentials don't have access to `P`).
+    *   `response.property_used.account_was_explicit is False` so the agent can see it was using default credentials and re-issue with `account="alice@example.com"`.
+
+### Test Case 11.9: No default credentials + OAuth accounts exist — actionable error from `list_properties()`
+
+*   **Goal:** Don't let the underlying ADC error bubble up. Don't silently fall back to "the first OAuth account".
+*   **Setup:** Unset `GOOGLE_APPLICATION_CREDENTIALS`. Register at least one OAuth account. Call `list_properties()` with no `account`.
+*   **Expected:**
+    *   `response.error` mentions "list_properties() without account uses default credentials".
+    *   `response.available_accounts` is a list of all registered OAuth emails.
+    *   `response.usage` instructs to call `list_properties(account="<email>")`.
+    *   Tool does NOT silently use one of the OAuth accounts.
+
+### Test Case 11.10: Write-tool default-property notice — `ga4_create_key_event`
+
+*   **Goal:** Silent default-property writes are the highest-stakes failure mode. Verify the notice fires.
+*   **Setup:** Set `GA4_PROPERTY_ID`, call `ga4_create_key_event(event_name="form_submit")` with no `property_id`.
+*   **Expected:**
+    *   On success/created/existed, `response.property_used.was_explicit is False` AND `response.notice` is present.
+
+### Test Case 11.11: `ga4_update_data_stream(confirm=False)` early-return includes `property_used`
+
+*   **Goal:** When the tool refuses to execute without `confirm=True`, the agent prompting the user must still see WHICH property the change would land on.
+*   **Setup:** Call `ga4_update_data_stream(stream_id="123", display_name="x", confirm=False)` with no `property_id` while `GA4_PROPERTY_ID` is set.
+*   **Expected:**
+    *   `response.error` mentions "confirm=True is required".
+    *   `response.confirm_required is True`.
+    *   `response.property_used` is present and points to the default property.
+    *   `response.notice` is present (was_explicit was False).
+
+### Test Case 11.12: `ga4_create_custom_dimension(scope="USER", allow_user_scope=False)` soft-block includes `property_used`
+
+*   **Goal:** Same reasoning as 11.11 — confirm flow must show target property.
+*   **Setup:** Call `ga4_create_custom_dimension(parameter_name="x", display_name="X", scope="USER", allow_user_scope=False)` with no `property_id` while `GA4_PROPERTY_ID` is set.
+*   **Expected:**
+    *   `response.error` mentions USER-scope cost implications.
+    *   `response.property_used` is present.
+    *   `response.notice` is present.
+
+### Test Case 11.13: `get_property_schema` does not mutate `SCHEMA_CACHE`
+
+*   **Goal:** Adding `property_used` to the response must not pollute the cached schema for future calls.
+*   **Setup:** Call `get_property_schema(property_id="<X>")` once with `was_explicit=True` (returns property_used.was_explicit=True). Then call it again with no `property_id` while `GA4_PROPERTY_ID="<X>"` (returns property_used.was_explicit=False).
+*   **Expected:**
+    *   First response: `property_used.was_explicit is True`.
+    *   Second response: `property_used.was_explicit is False` (NOT True — would be the bug if the cache had been mutated).
+    *   Inspect `ga4_mcp.tools.metadata.SCHEMA_CACHE[(<X>, "__default__")]` directly: it must NOT contain a `property_used` key.
+
+### Test Case 11.14: `_resolve_pid_or_error` rejects whitespace as explicit
+
+*   **Goal:** `bool("   ")` is True. Verify the resolver strips before computing `was_explicit`.
+*   **Setup (unit test):** Call `_resolve_pid_or_error("   ")` directly.
+*   **Expected:**
+    *   Returns `(None, False, {"error": ...})` — `was_explicit` must be `False`, not `True`.
+    *   The error message references `list_accounts()`, `list_properties()`, and `account=`.
+
+### Test Case 11.15: Backward compat — flat-dict tools unchanged
+
+*   **Goal:** `get_dimensions_by_category` and `get_metrics_by_category` return flat `{name: description}` dicts — no `property_used` injected, no shape change.
+*   **Setup:** Call each with a known-good category.
+*   **Expected:**
+    *   Response is a dict whose values are all strings (descriptions).
+    *   No `property_used` key in the response.
+    *   No `notice` key in the response.
+    *   `for name, desc in response.items(): assert isinstance(desc, str)` succeeds.
+
+### Test Case 11.16: Backward compat — `list_properties.default_property_id` unchanged
+
+*   **Goal:** Existing scripts that read `default_property_id` still work.
+*   **Setup:** Set `GA4_PROPERTY_ID`, call `list_properties()`.
+*   **Expected:**
+    *   `response.default_property_id == "<set-value>"` exactly.
+    *   `response.using_account`, `response.name_contains`, `response.total` are present and behave as in v3.2.0.

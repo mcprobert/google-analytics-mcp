@@ -22,7 +22,12 @@ from google.analytics.data_v1beta.types import (
     Filter, OrderBy, MetricAggregation
 )
 from ga4_mcp.coordinator import mcp
-from ga4_mcp.tools.metadata import _resolve_pid_or_error, _get_schema
+from ga4_mcp.tools.metadata import (
+    _resolve_pid_or_error,
+    _get_schema,
+    _property_used_meta,
+    _default_used_notice,
+)
 from ga4_mcp.auth import resolve_credentials
 
 # Context-safety constants for the aggregation tools below. get_ga4_data has its own
@@ -117,19 +122,39 @@ def get_ga4_data(
                                     warning and execute the query anyway.
         enable_aggregation: (Optional) If True, uses server-side aggregation when
                             beneficial. Defaults to True.
-        property_id: (Optional) GA4 property ID (numeric) to query. Defaults to the configured property.
-                     Use list_properties() to see all available properties.
-        account: (Optional) Email of a registered OAuth account. Omit for default credentials.
-                 Use list_accounts() to see available accounts.
+        property_id: (Optional) GA4 property ID (numeric) to query. If omitted, uses
+            GA4_PROPERTY_ID if set. Pass any property_id from list_properties() to
+            query a specific property your account can access — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here.
+        account: (Optional) Registered OAuth account email used as credentials. If
+            omitted, uses default credentials only — it does not search all registered
+            accounts. Properties are credential-scoped: if a property was returned by
+            list_properties(account="user@example.com"), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
     if dimensions is None:
         dimensions = ["date"]
     if metrics is None:
         metrics = ["totalUsers", "newUsers", "sessions"]
 
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
+
+    # Build once and stamp on every non-error return path that ran past
+    # property resolution — including estimate_only and the large-dataset
+    # warning. Otherwise agents wouldn't know which property the warning
+    # was talking about when they omitted property_id.
+    property_used = _property_used_meta(pid, was_explicit, account)
+    default_notice = _default_used_notice(was_explicit, pid, account)
+
+    def _annotate(response):
+        response["property_used"] = property_used
+        if default_notice:
+            response["notice"] = default_notice
+        return response
 
     try:
         schema = _get_schema(pid, account)
@@ -190,10 +215,10 @@ def get_ga4_data(
                 estimated_rows = estimation_res.row_count
 
                 if estimate_only:
-                    return {"estimated_rows": estimated_rows}
+                    return _annotate({"estimated_rows": estimated_rows})
 
                 if estimated_rows > 2500:
-                    return {
+                    return _annotate({
                         "warning": "Query will return a large dataset.",
                         "estimated_rows": estimated_rows,
                         "suggestions": [
@@ -202,20 +227,20 @@ def get_ga4_data(
                             "Use fewer dimensions.",
                             "Or, re-run with proceed_with_large_dataset=True to fetch the data anyway."
                         ]
-                    }
+                    })
             except Exception as e:
                 print(f"WARNING: Row count estimation failed: {e}", file=sys.stderr)
                 if estimate_only:
                     return {"error": f"Could not estimate row count: {e}"}
                 if not proceed_with_large_dataset:
-                    return {
+                    return _annotate({
                         "warning": "Could not safely estimate dataset size.",
                         "estimation_error": str(e),
                         "suggestions": [
                             "Retry the query.",
                             "Or re-run with proceed_with_large_dataset=True to bypass the safety check."
                         ]
-                    }
+                    })
 
         # --- Main GA4 API Call ---
         request = RunReportRequest(
@@ -240,13 +265,13 @@ def get_ga4_data(
                 data_row[met_header.name] = row.metric_values[i].value
             result.append(data_row)
 
-        return {
+        return _annotate({
             "data": result,
             "metadata": {
                 "total_rows_in_source": response.row_count,
                 "returned_rows": len(result),
             }
-        }
+        })
     except Exception as e:
         error_message = f"Error fetching GA4 data: {str(e)}"
         print(error_message, file=sys.stderr)
@@ -378,10 +403,19 @@ def ga4_get_landing_page_summary(
         form_event_names: Event names counted as form conversions in totals. Default
                           ["form_submit", "form_start"]. Override for properties that use
                           "generate_lead", "contact", "submit_application", etc.
-        property_id: (Optional) Numeric GA4 property ID. Defaults to the configured property.
-        account: (Optional) Registered OAuth account email. Omit for default credentials.
+        property_id: (Optional) GA4 property ID (numeric) to query. If omitted, uses
+            GA4_PROPERTY_ID if set. Pass any property_id from list_properties() to
+            query a specific property your account can access — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here.
+        account: (Optional) Registered OAuth account email used as credentials. If
+            omitted, uses default credentials only — it does not search all registered
+            accounts. Properties are credential-scoped: if a property was returned by
+            list_properties(account="user@example.com"), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
 
@@ -631,7 +665,7 @@ def ga4_get_landing_page_summary(
             "sessions are starting without a page_view at all."
         )
 
-    return {
+    response = {
         "status": "success",
         "rows": shaped_rows,
         "totals": {
@@ -670,6 +704,7 @@ def ga4_get_landing_page_summary(
             "form_events_probe_ok": form_events_probe_ok,
         },
         "warnings": warnings,
+        "property_used": _property_used_meta(pid, was_explicit, account),
         "metadata": {
             "property_id": pid,
             "date_range": {"start": date_range_start, "end": date_range_end},
@@ -678,6 +713,10 @@ def ga4_get_landing_page_summary(
             "returned_rows": len(shaped_rows),
         },
     }
+    notice = _default_used_notice(was_explicit, pid, account)
+    if notice:
+        response["notice"] = notice
+    return response
 
 
 @mcp.tool()
@@ -725,10 +764,19 @@ def ga4_compare_periods(
         sort_by_delta: Metric name (must be in ``metrics``) whose absolute delta is used to sort rows.
         top_n: Rows to return after sorting. Clamped to 1..200. Default 50.
         dimension_filter: (Optional) Same FilterExpression dict shape as get_ga4_data.
-        property_id: (Optional) Numeric GA4 property ID.
-        account: (Optional) Registered OAuth account email.
+        property_id: (Optional) GA4 property ID (numeric) to query. If omitted, uses
+            GA4_PROPERTY_ID if set. Pass any property_id from list_properties() to
+            query a specific property your account can access — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here.
+        account: (Optional) Registered OAuth account email used as credentials. If
+            omitted, uses default credentials only — it does not search all registered
+            accounts. Properties are credential-scoped: if a property was returned by
+            list_properties(account="user@example.com"), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
 
@@ -875,7 +923,7 @@ def ga4_compare_periods(
                 "pct_delta": round(pct_delta, 4) if pct_delta is not None else None,
             }
 
-    return {
+    response = {
         "status": "success",
         "rows": top_rows,
         "totals_delta": totals_delta,
@@ -884,6 +932,7 @@ def ga4_compare_periods(
             "period_a_totals_available": a_totals_available,
             "period_b_totals_available": b_totals_available,
         },
+        "property_used": _property_used_meta(pid, was_explicit, account),
         "metadata": {
             "property_id": pid,
             "period_a": {"start": period_a_start, "end": period_a_end},
@@ -904,3 +953,7 @@ def ga4_compare_periods(
             ),
         },
     }
+    notice = _default_used_notice(was_explicit, pid, account)
+    if notice:
+        response["notice"] = notice
+    return response

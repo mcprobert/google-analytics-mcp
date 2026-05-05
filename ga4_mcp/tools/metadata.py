@@ -89,14 +89,73 @@ def _fetch_schema(property_id: str, account: str = None) -> dict:
 
 
 def _resolve_pid_or_error(property_id: str = None) -> tuple:
-    """Resolve property ID, returning (pid, None) or (None, error_dict)."""
+    """Resolve property ID, returning (pid, was_explicit, error_dict).
+
+    ``was_explicit`` is True when the caller passed a non-blank property_id;
+    False when the resolver fell back to ``DEFAULT_PROPERTY_ID``. This lets
+    each tool surface in its response whether the configured default was
+    used silently, so agents can detect the case where they think they're
+    querying property X but actually got default Y.
+    """
+    raw = "" if property_id is None else str(property_id).strip()
+    was_explicit = bool(raw)
     try:
-        pid = _resolve_property_id(property_id)
+        pid = _resolve_property_id(raw or None)
     except ValueError as e:
-        return None, {"error": str(e)}
+        return None, was_explicit, {"error": str(e)}
     if not pid:
-        return None, {"error": "No property_id provided and no default GA4_PROPERTY_ID configured."}
-    return pid, None
+        return None, was_explicit, {"error": (
+            "No property_id provided and no default GA4_PROPERTY_ID configured. "
+            "Call list_accounts() to see credential accounts, then "
+            "list_properties() (or list_properties(account=\"...\") for OAuth) to "
+            "discover properties, then pass property_id explicitly. If the property "
+            "belongs to a registered OAuth account, also pass account=\"...\"."
+        )}
+    return pid, was_explicit, None
+
+
+def _property_used_meta(pid: str, was_explicit: bool, account: str = None) -> dict:
+    """Build the property_used block included in tool responses.
+
+    ``account_parameter`` is the value the agent should pass back as the
+    ``account`` argument on subsequent calls — None means "omit it" (default
+    credentials). The literal string "default credentials" is for display
+    only and must NOT be passed as an account argument.
+    """
+    account_value = str(account).strip() if account else None
+    return {
+        "id": pid,
+        "was_explicit": was_explicit,
+        "account": account_value or "default credentials",
+        "account_parameter": account_value,
+        "account_was_explicit": bool(account_value),
+    }
+
+
+def _default_used_notice(was_explicit: bool, pid: str, account: str = None):
+    """Return a one-line notice when the default property was used silently.
+
+    Returns None when the caller passed property_id explicitly, or when no
+    property was resolved. Wording is account-aware so agents see exactly
+    which credential was used and how to scope a follow-up query.
+    """
+    if was_explicit or not pid:
+        return None
+    account_value = str(account).strip() if account else None
+    if account_value:
+        return (
+            f"Used configured default property {pid} because property_id was omitted. "
+            f"Credential used: {account_value}. To query another property for this "
+            f"credential, pass property_id explicitly. Use "
+            f"list_properties(account=\"{account_value}\") to see properties for this account."
+        )
+    return (
+        f"Used configured default property {pid} because property_id was omitted. "
+        "Credential used: default credentials. To query another property, pass "
+        "property_id explicitly. If the property belongs to a registered OAuth "
+        "account, also pass account=\"...\". Use list_accounts() and "
+        "list_properties(account=\"...\") to discover account-scoped properties."
+    )
 
 
 @mcp.tool()
@@ -115,6 +174,7 @@ def list_accounts():
         # Service accounts / ADC cannot be scope-checked against analytics.edit.
         accounts.append({
             "email": "default credentials",
+            "account_parameter": None,
             "type": "application_default",
             "granted_scopes": [],
             "can_edit": False,
@@ -124,8 +184,22 @@ def list_accounts():
         granted = get_granted_scopes(email) if email else []
         entry["granted_scopes"] = granted
         entry["can_edit"] = EDIT_SCOPE in granted
+        entry["account_parameter"] = email
         accounts.append(entry)
-    return {"accounts": accounts, "total": len(accounts)}
+    return {
+        "accounts": accounts,
+        "usage": (
+            "GA4 property access is credential-scoped. To discover properties, call "
+            "list_properties() for default credentials and list_properties(account=\"...\") "
+            "for each registered OAuth account. When querying a property returned by "
+            "list_properties(account=\"...\"), pass both property_id and the same "
+            "account to reporting/admin/schema tools. Omitting account uses default "
+            "credentials only — it does not search all registered accounts. "
+            "Pass an account_parameter value (or None for default credentials) — never "
+            "the literal string \"default credentials\"."
+        ),
+        "total": len(accounts),
+    }
 
 
 @mcp.tool()
@@ -189,12 +263,22 @@ def remove_registered_account(email: str):
 @mcp.tool()
 def list_properties(account: str = None, name_contains: str = None):
     """
-    List all GA4 properties accessible by the given account.
-    Returns account names and property IDs that can be used with other tools.
+    List all GA4 properties accessible by the given account credential.
+
+    GA4 property access is credential-scoped: this lists ONLY properties
+    accessible to the credential identified by ``account`` (or default
+    credentials when ``account`` is omitted). It is NOT a global list across
+    all registered accounts. To discover properties under other accounts,
+    call list_accounts() and then list_properties(account="...") for each one.
+    When querying one of these properties via reporting/admin/schema tools,
+    pass both property_id AND the same account.
 
     Args:
-        account: (Optional) Email of a registered OAuth account. If omitted, uses the
-                 default credentials. Use list_accounts() to see available accounts.
+        account: (Optional) Registered OAuth account email used as credentials.
+            If omitted, uses default credentials only — does not search all
+            registered accounts. Use list_accounts() to see available
+            credential accounts. Do not pass the literal string "default
+            credentials".
         name_contains: (Optional) Case-insensitive substring filter on property display
                        name. Useful for accounts with many properties.
     """
@@ -203,6 +287,27 @@ def list_properties(account: str = None, name_contains: str = None):
         from google.analytics.admin_v1beta.types import ListAccountsRequest, ListPropertiesRequest
     except ImportError:
         return {"error": "google-analytics-admin package not installed. Run: pip install google-analytics-admin"}
+
+    # Pre-flight: when no account was passed AND no default credentials are
+    # configured, but registered OAuth accounts DO exist, fail with an
+    # actionable error rather than letting the underlying ADC failure bubble
+    # up. Silently falling back to "the first OAuth account" would create a
+    # new default trap.
+    registered_emails = [
+        e.get("email") for e in list_registered_accounts() if e.get("email")
+    ]
+    if account is None and not has_default_credentials() and registered_emails:
+        return {
+            "error": (
+                "list_properties() without account uses default credentials, but "
+                "none are configured."
+            ),
+            "available_accounts": registered_emails,
+            "usage": (
+                "Call list_properties(account=\"<email>\") for a registered OAuth "
+                "account."
+            ),
+        }
 
     try:
         creds = resolve_credentials(account)
@@ -223,10 +328,35 @@ def list_properties(account: str = None, name_contains: str = None):
                     "account_name": ga_account.display_name,
                 })
 
+        other_accounts = [e for e in registered_emails if e != account]
+        if account:
+            usage = (
+                f"This lists properties only for credential account {account}. "
+                f"Pass property_id from properties[] AND account=\"{account}\" to "
+                f"other tools to query one of these properties. This is not a "
+                f"global list across all registered accounts. "
+                f"properties[].account_name is the GA account display name, not "
+                f"the MCP account parameter."
+            )
+        else:
+            usage = (
+                "This lists properties only for default credentials because "
+                "account was omitted. It does NOT include properties accessible "
+                "only through registered OAuth accounts. Pass property_id from "
+                "properties[] to other tools for default credentials. For OAuth "
+                "accounts, call list_accounts() then list_properties(account=\"...\") "
+                "and pass both property_id and the same account to other tools. "
+                "properties[].account_name is the GA account display name, not "
+                "the MCP account parameter."
+            )
+
         return {
             "properties": result,
+            "usage": usage,
             "default_property_id": DEFAULT_PROPERTY_ID,
             "using_account": account or "default credentials",
+            "account_parameter": account,
+            "other_accounts_available": other_accounts,
             "name_contains": name_contains,
             "total": len(result),
         }
@@ -245,10 +375,19 @@ def search_schema(keyword: str, property_id: str = None, account: str = None):
 
     Args:
         keyword: One or more keywords to search for (e.g., "user", "campaign revenue").
-        property_id: (Optional) GA4 property ID (numeric). Defaults to the configured property.
-        account: (Optional) Email of a registered OAuth account. Omit for default credentials.
+        property_id: (Optional) GA4 property ID (numeric) to query. If omitted, uses
+            GA4_PROPERTY_ID if set. Pass any property_id from list_properties() to
+            query a specific property your account can access — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here.
+        account: (Optional) Registered OAuth account email used as credentials. If
+            omitted, uses default credentials only — it does not search all registered
+            accounts. Properties are credential-scoped: if a property was returned by
+            list_properties(account="user@example.com"), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
 
@@ -280,11 +419,26 @@ def search_schema(keyword: str, property_id: str = None, account: str = None):
         if score > 0:
             scores[f"METRIC: {name}"] = score
 
+    property_used = _property_used_meta(pid, was_explicit, account)
+    notice = _default_used_notice(was_explicit, pid, account)
+
     if not scores:
-        return {"message": f"No dimensions or metrics found matching '{keyword}'."}
+        response = {
+            "message": f"No dimensions or metrics found matching '{keyword}'.",
+            "property_used": property_used,
+        }
+        if notice:
+            response["notice"] = notice
+        return response
 
     sorted_results = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-    return {"top_results": dict(sorted_results[:10])}
+    response = {
+        "top_results": dict(sorted_results[:10]),
+        "property_used": property_used,
+    }
+    if notice:
+        response["notice"] = notice
+    return response
 
 
 @mcp.tool()
@@ -295,17 +449,37 @@ def get_property_schema(property_id: str = None, account: str = None):
     a very large object (10k+ tokens). Use search_schema for most discovery tasks.
 
     Args:
-        property_id: (Optional) GA4 property ID (numeric). Defaults to the configured property.
-        account: (Optional) Email of a registered OAuth account. Omit for default credentials.
+        property_id: (Optional) GA4 property ID (numeric) to query. If omitted, uses
+            GA4_PROPERTY_ID if set. Pass any property_id from list_properties() to
+            query a specific property your account can access — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here.
+        account: (Optional) Registered OAuth account email used as credentials. If
+            omitted, uses default credentials only — it does not search all registered
+            accounts. Properties are credential-scoped: if a property was returned by
+            list_properties(account="user@example.com"), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
 
     try:
-        return _get_schema(pid, account)
+        schema = _get_schema(pid, account)
     except Exception as e:
         return {"error": f"Failed to load schema for property '{pid}': {e}"}
+
+    # Build a fresh response wrapping the cached schema. We MUST NOT mutate
+    # the cached dict — adding property_used to schema in place would
+    # pollute SCHEMA_CACHE so future calls would carry stale property_used
+    # values. Shallow-copy via dict unpacking is sufficient because the
+    # nested dimensions/metrics dicts are read-only here.
+    response = {**schema, "property_used": _property_used_meta(pid, was_explicit, account)}
+    notice = _default_used_notice(was_explicit, pid, account)
+    if notice:
+        response["notice"] = notice
+    return response
 
 
 @mcp.tool()
@@ -315,10 +489,19 @@ def list_dimension_categories(property_id: str = None, account: str = None):
     This is a low-cost way to begin exploring the schema.
 
     Args:
-        property_id: (Optional) GA4 property ID (numeric). Defaults to the configured property.
-        account: (Optional) Email of a registered OAuth account. Omit for default credentials.
+        property_id: (Optional) GA4 property ID (numeric) to query. If omitted, uses
+            GA4_PROPERTY_ID if set. Pass any property_id from list_properties() to
+            query a specific property your account can access — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here.
+        account: (Optional) Registered OAuth account email used as credentials. If
+            omitted, uses default credentials only — it does not search all registered
+            accounts. Properties are credential-scoped: if a property was returned by
+            list_properties(account="user@example.com"), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
 
@@ -334,7 +517,14 @@ def list_dimension_categories(property_id: str = None, account: str = None):
             categories[category] = 0
         categories[category] += 1
 
-    return {"dimension_categories": categories}
+    response = {
+        "dimension_categories": categories,
+        "property_used": _property_used_meta(pid, was_explicit, account),
+    }
+    notice = _default_used_notice(was_explicit, pid, account)
+    if notice:
+        response["notice"] = notice
+    return response
 
 @mcp.tool()
 def list_metric_categories(property_id: str = None, account: str = None):
@@ -343,10 +533,19 @@ def list_metric_categories(property_id: str = None, account: str = None):
     This is a low-cost way to begin exploring the schema.
 
     Args:
-        property_id: (Optional) GA4 property ID (numeric). Defaults to the configured property.
-        account: (Optional) Email of a registered OAuth account. Omit for default credentials.
+        property_id: (Optional) GA4 property ID (numeric) to query. If omitted, uses
+            GA4_PROPERTY_ID if set. Pass any property_id from list_properties() to
+            query a specific property your account can access — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here.
+        account: (Optional) Registered OAuth account email used as credentials. If
+            omitted, uses default credentials only — it does not search all registered
+            accounts. Properties are credential-scoped: if a property was returned by
+            list_properties(account="user@example.com"), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
 
@@ -362,19 +561,41 @@ def list_metric_categories(property_id: str = None, account: str = None):
             categories[category] = 0
         categories[category] += 1
 
-    return {"metric_categories": categories}
+    response = {
+        "metric_categories": categories,
+        "property_used": _property_used_meta(pid, was_explicit, account),
+    }
+    notice = _default_used_notice(was_explicit, pid, account)
+    if notice:
+        response["notice"] = notice
+    return response
 
 @mcp.tool()
 def get_dimensions_by_category(category: str, property_id: str = None, account: str = None):
     """
     Get all dimensions in a specific category with their descriptions.
 
+    Returns a flat ``{name: description}`` dict (one entry per dimension).
+    The flat shape is preserved for backward compatibility, so this tool does
+    NOT include the ``property_used`` / ``notice`` metadata that other tools
+    return. Use ``list_properties()`` and the docstring guidance below to
+    pick the right ``(account, property_id)`` pair before calling.
+
     Args:
         category: The category name to retrieve dimensions for.
-        property_id: (Optional) GA4 property ID (numeric). Defaults to the configured property.
-        account: (Optional) Email of a registered OAuth account. Omit for default credentials.
+        property_id: (Optional) GA4 property ID (numeric) to query. If omitted, uses
+            GA4_PROPERTY_ID if set. Pass any property_id from list_properties() to
+            query a specific property your account can access — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here.
+        account: (Optional) Registered OAuth account email used as credentials. If
+            omitted, uses default credentials only — it does not search all registered
+            accounts. Properties are credential-scoped: if a property was returned by
+            list_properties(account="user@example.com"), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, _was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
 
@@ -398,12 +619,27 @@ def get_metrics_by_category(category: str, property_id: str = None, account: str
     """
     Get all metrics in a specific category with their descriptions.
 
+    Returns a flat ``{name: description}`` dict (one entry per metric).
+    The flat shape is preserved for backward compatibility, so this tool does
+    NOT include the ``property_used`` / ``notice`` metadata that other tools
+    return. Use ``list_properties()`` and the docstring guidance below to
+    pick the right ``(account, property_id)`` pair before calling.
+
     Args:
         category: The category name to retrieve metrics for.
-        property_id: (Optional) GA4 property ID (numeric). Defaults to the configured property.
-        account: (Optional) Email of a registered OAuth account. Omit for default credentials.
+        property_id: (Optional) GA4 property ID (numeric) to query. If omitted, uses
+            GA4_PROPERTY_ID if set. Pass any property_id from list_properties() to
+            query a specific property your account can access — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here.
+        account: (Optional) Registered OAuth account email used as credentials. If
+            omitted, uses default credentials only — it does not search all registered
+            accounts. Properties are credential-scoped: if a property was returned by
+            list_properties(account="user@example.com"), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, _was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
 
@@ -468,10 +704,19 @@ def ga4_health_check(property_id: str = None, account: str = None):
     for diagnostic context, not the nulled fields.
 
     Args:
-        property_id: (Optional) Numeric GA4 property ID. Defaults to the configured property.
-        account: (Optional) Registered OAuth account email. Omit for default credentials.
+        property_id: (Optional) GA4 property ID (numeric) to query. If omitted, uses
+            GA4_PROPERTY_ID if set. Pass any property_id from list_properties() to
+            query a specific property your account can access — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here.
+        account: (Optional) Registered OAuth account email used as credentials. If
+            omitted, uses default credentials only — it does not search all registered
+            accounts. Properties are credential-scoped: if a property was returned by
+            list_properties(account="user@example.com"), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
 
@@ -774,7 +1019,7 @@ def ga4_health_check(property_id: str = None, account: str = None):
 
     if not (data_streams_probe_ok or key_events_probe_ok or data_probe_ok):
         # Complete failure — return error dict with diagnostic context.
-        return {
+        failure_response = {
             "error": (
                 "ga4_health_check could not reach the property — all probes "
                 "failed. Common causes: missing or invalid credentials, no "
@@ -784,9 +1029,14 @@ def ga4_health_check(property_id: str = None, account: str = None):
             ),
             "property_id": pid,
             "account": account or "default credentials",
+            "property_used": _property_used_meta(pid, was_explicit, account),
             "probes": probes,
             "warnings": warnings,
         }
+        notice = _default_used_notice(was_explicit, pid, account)
+        if notice:
+            failure_response["notice"] = notice
+        return failure_response
 
     all_probes_ok = (
         data_streams_probe_ok and key_events_probe_ok and data_probe_ok
@@ -797,7 +1047,7 @@ def ga4_health_check(property_id: str = None, account: str = None):
     # callers can distinguish "unknown" from "measured zero/false".
     # can_edit is computed from stored scopes (not probe-dependent) so it
     # stays a definitive bool.
-    return {
+    response = {
         "status": status,
         "property_id": pid,
         "has_data": has_data if data_probe_ok else None,
@@ -821,6 +1071,11 @@ def ga4_health_check(property_id: str = None, account: str = None):
         "data_streams": data_streams_info if data_streams_probe_ok else None,
         "can_edit": can_edit,  # never probe-dependent
         "account": account or "default credentials",
+        "property_used": _property_used_meta(pid, was_explicit, account),
         "probes": probes,
         "warnings": warnings,
     }
+    notice = _default_used_notice(was_explicit, pid, account)
+    if notice:
+        response["notice"] = notice
+    return response

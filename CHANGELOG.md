@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-05-05
+
+### Added — agent-discoverable multi-account / multi-property access
+
+Addresses a recurring failure mode: AI agents seeing a "default property" in tool responses and concluding the user has no access to other GA4 properties or other registered accounts. The selector for GA4 access is `(account, property_id)` as a pair — a property discovered under one credential requires that same credential on every later call. This release teaches that invariant through additive response metadata and clearer docstrings.
+
+- **`property_used` block** added to every successful response and every post-resolution early-return path on 15 tools (everything in `reporting.py`, the schema/health tools in `metadata.py`, and all 7 tools in `admin.py`). Shape: `{id, was_explicit, account, account_parameter, account_was_explicit}`. `account_parameter` is the value the agent should pass back as the `account` argument on subsequent calls (`None` means "omit it" — agents must not pass the literal string "default credentials").
+- **`notice` field** added on the same tools when the configured default property was used silently (`was_explicit: false`). Wording is account-aware so agents see exactly which credential was used and how to scope a follow-up query. Especially important on the four write tools (`ga4_create_key_event`, `ga4_delete_key_event`, `ga4_update_data_stream`, `ga4_create_custom_dimension`), where a silent default-property write is the highest-stakes failure mode. The `confirm_required` early-return on `ga4_update_data_stream` and the USER-scope soft-block on `ga4_create_custom_dimension` also stamp `property_used`/`notice` so an agent prompting the user to confirm sees the target property.
+- **`list_accounts()`** response now includes a top-level `usage` string explaining that GA4 access is credential-scoped, and a per-entry `account_parameter` field (`None` for default credentials, the email for OAuth accounts) so agents know what value to pass as `account=...`.
+- **`list_properties()`** response now includes a top-level `usage` string clarifying that the result is **not global** (only the credential being used), an `account_parameter` field, and an `other_accounts_available` list of registered OAuth emails so agents can enumerate them. When called with no `account`, no default credentials configured, but OAuth accounts exist, it now returns an actionable `error` + `available_accounts` + `usage` payload instead of letting the underlying ADC error bubble up. (No silent fallback to "the first OAuth account" — that would create a new default trap.)
+- **`get_property_schema()`** response now includes `property_used`, built via shallow-copy so the cached `SCHEMA_CACHE` entry is never mutated.
+- **`get_ga4_data()`** stamps `property_used`/`notice` on `estimate_only`, the large-dataset warning, the estimation-failed warning, AND the main success return — agents get the same context regardless of which path the call took.
+
+### Changed
+
+- `_resolve_pid_or_error` returns a 3-tuple `(pid, was_explicit, error)` (was `(pid, error)`). `was_explicit` is computed from the **stripped** input — `bool("   ")` is True, which would have falsely reported whitespace-only inputs as explicit. All ~15 internal call sites updated atomically.
+- The no-default error message now references `list_accounts()`, `list_properties(account="...")`, and the credential-scoping rule, instead of the generic "No property_id provided".
+- Docstrings on every `property_id` and `account` parameter (across all 15 affected tools plus `list_properties`) standardized to teach the (account, property_id) pairing rule and warn against passing the literal string `"default credentials"`.
+
+### Backward compatibility
+
+- All response changes are **additive sibling keys** — existing consumers reading `response["data"]`, `response["status"]`, `response["totals"]`, etc. continue to work.
+- `default_property_id`, `using_account`, `name_contains`, `total` keys on `list_properties()` are unchanged.
+- `accounts[*].email` on `list_accounts()` is unchanged; `account_parameter` is additive.
+- `get_dimensions_by_category` and `get_metrics_by_category` return flat `{name: description}` dicts and are **deliberately excluded** from `property_used` injection — adding a sibling key would break consumers iterating `for name, desc in response.items()`. Multi-property guidance reaches them via docstrings only.
+- The `_resolve_pid_or_error` arity change is internal; no public surface affected.
+
 ## [3.2.0] - 2026-04-08
 
 ### Added

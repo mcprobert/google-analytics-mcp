@@ -28,7 +28,11 @@ import json
 
 from ga4_mcp.coordinator import mcp
 from ga4_mcp.auth import resolve_credentials, ensure_edit_scope, _safe_account_path
-from ga4_mcp.tools.metadata import _resolve_pid_or_error
+from ga4_mcp.tools.metadata import (
+    _resolve_pid_or_error,
+    _property_used_meta,
+    _default_used_notice,
+)
 
 
 class AdminClientError(Exception):
@@ -244,13 +248,22 @@ def ga4_list_key_events(property_id: str = None, account: str = None):
     Read-only — does not require the analytics.edit scope.
 
     Args:
-        property_id: (Optional) Numeric GA4 property ID. Defaults to the configured property.
-        account: (Optional) Registered OAuth account email. Omit for default credentials.
+        property_id: (Optional) GA4 property ID (numeric) to query. If omitted, uses
+            GA4_PROPERTY_ID if set. Pass any property_id from list_properties() to
+            query a specific property your account can access — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here.
+        account: (Optional) Registered OAuth account email used as credentials. If
+            omitted, uses default credentials only — it does not search all registered
+            accounts. Properties are credential-scoped: if a property was returned by
+            list_properties(account="user@example.com"), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
     adm = _import_admin()
     if adm is None:
         return _missing_admin_error()
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
     try:
@@ -259,12 +272,17 @@ def ga4_list_key_events(property_id: str = None, account: str = None):
         events = []
         for ke in client.list_key_events(request=adm["ListKeyEventsRequest"](parent=parent)):
             events.append(_to_dict(ke, adm["MessageToDict"]))
-        return {
+        response = {
             "status": "success",
             "property_id": pid,
             "key_events": events,
             "total": len(events),
+            "property_used": _property_used_meta(pid, was_explicit, account),
         }
+        notice = _default_used_notice(was_explicit, pid, account)
+        if notice:
+            response["notice"] = notice
+        return response
     except AdminClientError as e:
         return e.payload
     except adm["PermissionDenied"] as e:
@@ -289,8 +307,18 @@ def ga4_create_key_event(
         event_name: The name of the event to mark as a key event (e.g., "form_submit").
         counting_method: "ONCE_PER_EVENT" (default, counts every firing) or
                          "ONCE_PER_SESSION" (counts at most once per session).
-        property_id: (Optional) Numeric GA4 property ID. Defaults to the configured property.
-        account: (Optional) Registered OAuth account email. Must have analytics.edit scope.
+        property_id: (Optional) GA4 property ID (numeric) to write to. If omitted,
+            uses GA4_PROPERTY_ID if set. Pass any property_id from list_properties()
+            to write to a specific property your account can edit — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here. **Writes are
+            high-stakes**: prefer passing property_id explicitly to avoid silently
+            modifying the wrong default property.
+        account: (Optional) Registered OAuth account email used as credentials. Must
+            have analytics.edit scope. Properties are credential-scoped: if a property
+            was returned by list_properties(account="..."), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
     adm = _import_admin()
     if adm is None:
@@ -298,7 +326,7 @@ def ga4_create_key_event(
     gate = ensure_edit_scope(account)
     if gate:
         return gate
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
     if not event_name:
@@ -311,6 +339,15 @@ def ga4_create_key_event(
             )
         }
 
+    property_used = _property_used_meta(pid, was_explicit, account)
+    default_notice = _default_used_notice(was_explicit, pid, account)
+
+    def _annotate(response):
+        response["property_used"] = property_used
+        if default_notice:
+            response["notice"] = default_notice
+        return response
+
     try:
         client = _admin_client(account, adm)
         parent = f"properties/{pid}"
@@ -318,11 +355,11 @@ def ga4_create_key_event(
         # 1. Idempotency: check if this key event already exists.
         existing = _find_key_event_by_name(client, parent, event_name, adm)
         if existing is not None:
-            return {
+            return _annotate({
                 "status": "success",
                 "action": "existed",
                 "data": _to_dict(existing, adm["MessageToDict"]),
-            }
+            })
 
         # 2. Create.
         ke = adm["KeyEvent"](event_name=event_name, counting_method=counting_method)
@@ -335,22 +372,22 @@ def ga4_create_key_event(
             # (also paginated) and return the record they created.
             raced = _find_key_event_by_name(client, parent, event_name, adm)
             if raced is not None:
-                return {
+                return _annotate({
                     "status": "success",
                     "action": "existed",
                     "data": _to_dict(raced, adm["MessageToDict"]),
-                }
+                })
             return {
                 "error": (
                     f"AlreadyExists race could not be resolved for event '{event_name}'. "
                     "Re-run ga4_list_key_events to see the current state."
                 )
             }
-        return {
+        return _annotate({
             "status": "success",
             "action": "created",
             "data": _to_dict(created, adm["MessageToDict"]),
-        }
+        })
     except AdminClientError as e:
         return e.payload
     except adm["PermissionDenied"] as e:
@@ -377,8 +414,18 @@ def ga4_delete_key_event(
     Args:
         event_name: The event_name of the key event to delete (e.g., "form_submit").
         dry_run: If True, returns what would be deleted without actually deleting it.
-        property_id: (Optional) Numeric GA4 property ID. Defaults to the configured property.
-        account: (Optional) Registered OAuth account email. Must have analytics.edit scope.
+        property_id: (Optional) GA4 property ID (numeric) to write to. If omitted,
+            uses GA4_PROPERTY_ID if set. Pass any property_id from list_properties()
+            to write to a specific property your account can edit — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here. **Writes are
+            high-stakes**: prefer passing property_id explicitly to avoid silently
+            modifying the wrong default property.
+        account: (Optional) Registered OAuth account email used as credentials. Must
+            have analytics.edit scope. Properties are credential-scoped: if a property
+            was returned by list_properties(account="..."), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
     adm = _import_admin()
     if adm is None:
@@ -386,38 +433,47 @@ def ga4_delete_key_event(
     gate = ensure_edit_scope(account)
     if gate:
         return gate
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
     if not event_name:
         return {"error": "event_name is required."}
+
+    property_used = _property_used_meta(pid, was_explicit, account)
+    default_notice = _default_used_notice(was_explicit, pid, account)
+
+    def _annotate(response):
+        response["property_used"] = property_used
+        if default_notice:
+            response["notice"] = default_notice
+        return response
 
     try:
         client = _admin_client(account, adm)
         parent = f"properties/{pid}"
         target = _find_key_event_by_name(client, parent, event_name, adm)
         if target is None:
-            return {
+            return _annotate({
                 "error": f"No key event with event_name='{event_name}' found on property {pid}.",
                 "property_id": pid,
                 "event_name": event_name,
-            }
+            })
         target_dict = _to_dict(target, adm["MessageToDict"])
         if dry_run:
-            return {
+            return _annotate({
                 "status": "success",
                 "action": "dry_run",
                 "dry_run": True,
                 "data": target_dict,
-            }
+            })
         client.delete_key_event(
             request=adm["DeleteKeyEventRequest"](name=target.name)
         )
-        return {
+        return _annotate({
             "status": "success",
             "action": "deleted",
             "data": target_dict,
-        }
+        })
     except AdminClientError as e:
         return e.payload
     except adm["PermissionDenied"] as e:
@@ -438,13 +494,22 @@ def ga4_list_data_streams(property_id: str = None, account: str = None):
     Read-only — does not require the analytics.edit scope.
 
     Args:
-        property_id: (Optional) Numeric GA4 property ID. Defaults to the configured property.
-        account: (Optional) Registered OAuth account email. Omit for default credentials.
+        property_id: (Optional) GA4 property ID (numeric) to query. If omitted, uses
+            GA4_PROPERTY_ID if set. Pass any property_id from list_properties() to
+            query a specific property your account can access — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here.
+        account: (Optional) Registered OAuth account email used as credentials. If
+            omitted, uses default credentials only — it does not search all registered
+            accounts. Properties are credential-scoped: if a property was returned by
+            list_properties(account="user@example.com"), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
     adm = _import_admin()
     if adm is None:
         return _missing_admin_error()
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
     try:
@@ -455,12 +520,17 @@ def ga4_list_data_streams(property_id: str = None, account: str = None):
             request=adm["ListDataStreamsRequest"](parent=parent)
         ):
             streams.append(_to_dict(ds, adm["MessageToDict"]))
-        return {
+        response = {
             "status": "success",
             "property_id": pid,
             "data_streams": streams,
             "total": len(streams),
+            "property_used": _property_used_meta(pid, was_explicit, account),
         }
+        notice = _default_used_notice(was_explicit, pid, account)
+        if notice:
+            response["notice"] = notice
+        return response
     except AdminClientError as e:
         return e.payload
     except adm["PermissionDenied"] as e:
@@ -490,8 +560,18 @@ def ga4_update_data_stream(
         display_name: New display name for the stream.
         web_stream_data_default_uri: (Web streams only) new default URI (e.g., "https://example.com").
         confirm: MUST be True to execute — guards against accidental LLM-initiated changes.
-        property_id: (Optional) Numeric GA4 property ID. Defaults to the configured property.
-        account: (Optional) Registered OAuth account email. Must have analytics.edit scope.
+        property_id: (Optional) GA4 property ID (numeric) to write to. If omitted,
+            uses GA4_PROPERTY_ID if set. Pass any property_id from list_properties()
+            to write to a specific property your account can edit — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here. **Writes are
+            high-stakes**: prefer passing property_id explicitly to avoid silently
+            modifying the wrong default property.
+        account: (Optional) Registered OAuth account email used as credentials. Must
+            have analytics.edit scope. Properties are credential-scoped: if a property
+            was returned by list_properties(account="..."), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
     adm = _import_admin()
     if adm is None:
@@ -499,19 +579,32 @@ def ga4_update_data_stream(
     gate = ensure_edit_scope(account)
     if gate:
         return gate
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
     if not stream_id:
         return {"error": "stream_id is required."}
+
+    property_used = _property_used_meta(pid, was_explicit, account)
+    default_notice = _default_used_notice(was_explicit, pid, account)
+
+    def _annotate(response):
+        response["property_used"] = property_used
+        if default_notice:
+            response["notice"] = default_notice
+        return response
+
     if not confirm:
-        return {
+        # The confirm-required path is the most important place for the
+        # default-property notice: an agent about to ask the user "shall I
+        # confirm?" must show which property they're about to modify.
+        return _annotate({
             "error": (
                 "confirm=True is required to execute ga4_update_data_stream. "
                 "This guards against accidental changes to visitor-facing configuration."
             ),
             "confirm_required": True,
-        }
+        })
     if display_name is None and web_stream_data_default_uri is None:
         return {
             "error": (
@@ -538,12 +631,12 @@ def ga4_update_data_stream(
                 update_mask=adm["FieldMask"](paths=paths),
             )
         )
-        return {
+        return _annotate({
             "status": "success",
             "action": "updated",
             "updated_fields": paths,
             "data": _to_dict(updated, adm["MessageToDict"]),
-        }
+        })
     except AdminClientError as e:
         return e.payload
     except adm["PermissionDenied"] as e:
@@ -564,13 +657,22 @@ def ga4_list_custom_dimensions(property_id: str = None, account: str = None):
     Read-only — does not require the analytics.edit scope.
 
     Args:
-        property_id: (Optional) Numeric GA4 property ID. Defaults to the configured property.
-        account: (Optional) Registered OAuth account email. Omit for default credentials.
+        property_id: (Optional) GA4 property ID (numeric) to query. If omitted, uses
+            GA4_PROPERTY_ID if set. Pass any property_id from list_properties() to
+            query a specific property your account can access — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here.
+        account: (Optional) Registered OAuth account email used as credentials. If
+            omitted, uses default credentials only — it does not search all registered
+            accounts. Properties are credential-scoped: if a property was returned by
+            list_properties(account="user@example.com"), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
     adm = _import_admin()
     if adm is None:
         return _missing_admin_error()
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
     try:
@@ -581,12 +683,17 @@ def ga4_list_custom_dimensions(property_id: str = None, account: str = None):
             request=adm["ListCustomDimensionsRequest"](parent=parent)
         ):
             dims.append(_to_dict(cd, adm["MessageToDict"]))
-        return {
+        response = {
             "status": "success",
             "property_id": pid,
             "custom_dimensions": dims,
             "total": len(dims),
+            "property_used": _property_used_meta(pid, was_explicit, account),
         }
+        notice = _default_used_notice(was_explicit, pid, account)
+        if notice:
+            response["notice"] = notice
+        return response
     except AdminClientError as e:
         return e.payload
     except adm["PermissionDenied"] as e:
@@ -619,8 +726,18 @@ def ga4_create_custom_dimension(
         scope: "EVENT" (default), "USER", or "ITEM".
         description: (Optional) Description shown in the GA4 UI.
         allow_user_scope: Required to be True when scope="USER". See soft-block note above.
-        property_id: (Optional) Numeric GA4 property ID. Defaults to the configured property.
-        account: (Optional) Registered OAuth account email. Must have analytics.edit scope.
+        property_id: (Optional) GA4 property ID (numeric) to write to. If omitted,
+            uses GA4_PROPERTY_ID if set. Pass any property_id from list_properties()
+            to write to a specific property your account can edit — you do not need a
+            configured default. If that property was discovered via
+            list_properties(account="..."), pass the same account here. **Writes are
+            high-stakes**: prefer passing property_id explicitly to avoid silently
+            modifying the wrong default property.
+        account: (Optional) Registered OAuth account email used as credentials. Must
+            have analytics.edit scope. Properties are credential-scoped: if a property
+            was returned by list_properties(account="..."), pass the same account here.
+            Use list_accounts() to see available credential accounts. Do not pass the
+            literal string "default credentials".
     """
     adm = _import_admin()
     if adm is None:
@@ -628,7 +745,7 @@ def ga4_create_custom_dimension(
     gate = ensure_edit_scope(account)
     if gate:
         return gate
-    pid, err = _resolve_pid_or_error(property_id)
+    pid, was_explicit, err = _resolve_pid_or_error(property_id)
     if err:
         return err
     if not parameter_name or not display_name:
@@ -636,8 +753,21 @@ def ga4_create_custom_dimension(
     scope = (scope or "EVENT").upper()
     if scope not in ("EVENT", "USER", "ITEM"):
         return {"error": f"Invalid scope '{scope}'. Must be EVENT, USER, or ITEM."}
+
+    property_used = _property_used_meta(pid, was_explicit, account)
+    default_notice = _default_used_notice(was_explicit, pid, account)
+
+    def _annotate(response):
+        response["property_used"] = property_used
+        if default_notice:
+            response["notice"] = default_notice
+        return response
+
     if scope == "USER" and not allow_user_scope:
-        return {
+        # Soft-block early return: stamp property_used so an agent prompting
+        # the user to confirm allow_user_scope=True can also confirm WHICH
+        # property the dimension would land on.
+        return _annotate({
             "error": (
                 "USER-scope custom dimensions attach to every user record and can bloat "
                 "GA4 storage quotas. Pass allow_user_scope=True to confirm you understand "
@@ -645,7 +775,7 @@ def ga4_create_custom_dimension(
             ),
             "parameter_name": parameter_name,
             "scope": scope,
-        }
+        })
 
     try:
         client = _admin_client(account, adm)
@@ -654,11 +784,11 @@ def ga4_create_custom_dimension(
         # Idempotency check.
         existing = _find_custom_dimension(client, parent, parameter_name, scope, adm)
         if existing is not None:
-            return {
+            return _annotate({
                 "status": "success",
                 "action": "existed",
                 "data": _to_dict(existing, adm["MessageToDict"]),
-            }
+            })
 
         scope_enum = getattr(adm["CustomDimension"].DimensionScope, scope)
         cd = adm["CustomDimension"](
@@ -678,22 +808,22 @@ def ga4_create_custom_dimension(
         except adm["AlreadyExists"]:
             raced = _find_custom_dimension(client, parent, parameter_name, scope, adm)
             if raced is not None:
-                return {
+                return _annotate({
                     "status": "success",
                     "action": "existed",
                     "data": _to_dict(raced, adm["MessageToDict"]),
-                }
+                })
             return {
                 "error": (
                     f"AlreadyExists race could not be resolved for custom dimension "
                     f"'{parameter_name}' (scope={scope})."
                 )
             }
-        return {
+        return _annotate({
             "status": "success",
             "action": "created",
             "data": _to_dict(created, adm["MessageToDict"]),
-        }
+        })
     except AdminClientError as e:
         return e.payload
     except adm["PermissionDenied"] as e:
