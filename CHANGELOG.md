@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.4.0] - 2026-07-06
+
+### Added — mount-independent, multi-user install
+
+Supports running the server from a shared network volume that different users (or macOS sessions) mount under different names (e.g. `/Volumes/Whitehat` vs `/Volumes/Whitehat1`, plus duplicate auto-mounts like `/Volumes/Whitehat-1`). Any absolute `/Volumes/<name>/...` path baked into config or a venv breaks for whoever is on a different mount name.
+
+- **`scripts/setup_user_env.sh`** — one-command per-user setup that self-locates the repo regardless of mount name and installs everything into `$HOME`: a venv at `~/.venvs/ga4-mcp` with the package installed **non-editable** (copied into the venv, so the running server never reads code off the share), the service-account key copied to `~/.config/ga4-mcp/service-account.json`, and a portable `.mcp.json`. It smoke-tests that `ga4_mcp` imports from the venv and not the share.
+- **Portable `.mcp.json` / `claude-config-template.json`** — use `${HOME}` expansion (supported by Claude Code in `command`, `args`, and `env`) so a single config resolves per-user with no hardcoded paths. `GA4_MCP_OAUTH_CLIENT_SECRETS` dropped from the template — `default_client.py` supplies embedded OAuth client credentials as fallback.
+- **README "Method C: Shared network volume (multi-user)"** documents the workflow, including re-running the setup script after pulling code changes (required by the non-editable install).
+
+### Note
+
+When the source lives on a network share, set `git config core.fileMode false` in the clone — SMB/AFP mounts report every file as mode `0755`, which otherwise shows every tracked file as modified.
+
 ## [3.3.0] - 2026-05-05
 
 ### Added — agent-discoverable multi-account / multi-property access

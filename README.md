@@ -139,6 +139,26 @@ If you plan to modify the package locally, use `python -m pip install -e .` inst
 }
 ```
 
+### Method C: Shared network volume (multi-user)
+
+If the clone lives on a shared network volume, different users (and even different macOS sessions for the same user) can mount it under different names — `/Volumes/Whitehat`, `/Volumes/Whitehat1`, or a duplicate auto-mount like `/Volumes/Whitehat-1`. Any absolute `/Volumes/<name>/...` path in your config or venv will then break for whoever is on a different mount name.
+
+To stay mount-independent, keep everything user-specific in `$HOME`. Each user runs, once:
+
+```bash
+bash scripts/setup_user_env.sh
+```
+
+This self-locates the repo (whatever the mount is called) and installs into the running user's home:
+
+- a venv at `~/.venvs/ga4-mcp` with the package installed **non-editable** — the code is copied into the venv, so the running server never reads off the share and is immune to mount renames;
+- the service-account key (if `docs/` ships one) at `~/.config/ga4-mcp/service-account.json`;
+- a portable `.mcp.json` using `${HOME}` (Claude Code expands `${VAR}` in `command`, `args`, and `env`), so the same config resolves correctly for every user.
+
+Because the install is non-editable, **re-run the script after pulling code changes** to refresh the installed copy.
+
+> **Tip:** on a network share, run `git config core.fileMode false` in the clone — SMB/AFP mounts report every file as executable, otherwise `git status` shows every tracked file as modified.
+
 ---
 
 ## Step 2: Sign In With Your Google Account

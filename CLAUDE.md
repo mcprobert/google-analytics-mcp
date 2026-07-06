@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Google Analytics 4 MCP server (v3.1.0) — gives AI agents analysis-ready GA4 access with zero-config OAuth login, multi-property queries, multi-account support, schema discovery, server-side aggregation, and smart defaults. Fork of surendranb/google-analytics-mcp. Built on FastMCP. Python 3.10+, Apache-2.0 license.
+Google Analytics 4 MCP server (v3.4.0) — gives AI agents analysis-ready GA4 access with zero-config OAuth login, multi-property queries, multi-account support, schema discovery, server-side aggregation, and smart defaults. Fork of surendranb/google-analytics-mcp. Built on FastMCP. Python 3.10+, Apache-2.0 license.
 
 ## Commands
 
@@ -13,6 +13,13 @@ Google Analytics 4 MCP server (v3.1.0) — gives AI agents analysis-ready GA4 ac
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
+
+### Install (shared network volume / multi-user, mount-independent)
+When the repo lives on a shared volume that different users mount under different names (e.g. `/Volumes/Whitehat` vs `/Volumes/Whitehat1`), never bake an absolute `/Volumes/<name>` path into config or a venv. Each user runs:
+```bash
+bash scripts/setup_user_env.sh      # builds ~/.venvs/ga4-mcp (non-editable), copies creds to ~/.config/ga4-mcp, writes portable .mcp.json
+```
+The generated `.mcp.json` uses `${HOME}` expansion so one config works for everyone. Re-run the script after pulling code changes (non-editable install). On a share, also set `git config core.fileMode false` to avoid spurious mode-only diffs.
 
 ### Run
 ```bash
