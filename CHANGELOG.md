@@ -17,6 +17,10 @@ Supports running the server from a shared network volume that different users (o
 - **Portable `.mcp.json` / `claude-config-template.json`** — use `${HOME}` expansion (supported by Claude Code in `command`, `args`, and `env`) so a single config resolves per-user with no hardcoded paths. `GA4_MCP_OAUTH_CLIENT_SECRETS` dropped from the template — `default_client.py` supplies embedded OAuth client credentials as fallback.
 - **README "Method C: Shared network volume (multi-user)"** documents the workflow, including re-running the setup script after pulling code changes (required by the non-editable install).
 
+### Fixed
+
+- `requirements.txt` synced with `pyproject.toml` — it was missing `google-analytics-admin` (used by the Admin API tools) and `google-auth-oauthlib` (a top-level import in `add_account.py`), so a `pip install -r requirements.txt` install lacked runtime dependencies the code imports.
+
 ### Note
 
 When the source lives on a network share, set `git config core.fileMode false` in the clone — SMB/AFP mounts report every file as mode `0755`, which otherwise shows every tracked file as modified.

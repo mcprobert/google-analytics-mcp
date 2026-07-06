@@ -28,6 +28,7 @@ Thumbs.db
 docs/*.json
 .mcp.json
 .venv/
+.claude/settings.local.json
 
 # Kiro IDE files
 .kiro/
